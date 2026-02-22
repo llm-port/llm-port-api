@@ -1,0 +1,54 @@
+services:
+  api: &main_app
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    image: llm_port_api:${LLM_PORT_API_VERSION:-latest}
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      rmq:
+        condition: service_healthy
+    environment:
+      LLM_PORT_API_HOST: 0.0.0.0
+      LLM_PORT_API_RABBIT_HOST: llm_port_api-rmq
+      LLM_PORT_API_REDIS_HOST: llm_port_api-redis
+
+  taskiq-worker:
+    <<: *main_app
+    labels: []
+    command:
+      - taskiq
+      - worker
+      - llm_port_api.tkq:broker
+
+  redis:
+    image: bitnami/redis:6.2.5
+    hostname: "llm_port_api-redis"
+    restart: always
+    environment:
+      ALLOW_EMPTY_PASSWORD: "yes"
+    healthcheck:
+      test: redis-cli ping
+      interval: 1s
+      timeout: 3s
+      retries: 50
+
+  rmq:
+    image: rabbitmq:3.9.16-alpine
+    hostname: "llm_port_api-rmq"
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: "guest"
+      RABBITMQ_DEFAULT_PASS: "guest"
+      RABBITMQ_DEFAULT_VHOST: "/"
+    healthcheck:
+      test: rabbitmq-diagnostics check_running -q
+      interval: 3s
+      timeout: 3s
+      retries: 50
+
+
