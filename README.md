@@ -19,6 +19,16 @@ poetry run python -m llm_port_api
 Swagger UI:
 - `/api/docs`
 
+## Docker Compose (Shared Stack)
+From `airgap_shared/`:
+```bash
+# Normal containerized run
+docker compose up -d llm-port-api
+
+# Dev mode with bind mount + reload (no image rebuild per code change)
+docker compose -f docker-compose.yaml -f docker-compose.dev.yaml up -d llm-port-api
+```
+
 ## Environment Variables
 Core variables:
 - `LLM_PORT_API_HOST`
