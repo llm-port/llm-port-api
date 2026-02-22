@@ -23,6 +23,7 @@ asyncpg = "^0.30.0"
 alembic = "^1.14.1"
 httpx = "^0.28.1"
 pyjwt = "^2.10.1"
+langfuse = "^2.60.5"
 redis = {version = "^5.2.1", extras = ["hiredis"]}
 aiofiles = "^24.1.0"
 httptools = "^0.6.4"

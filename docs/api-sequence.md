@@ -33,6 +33,7 @@ sequenceDiagram
     participant RT as RouterService
     participant LEASE as LeaseManager (Redis)
     participant UP as Upstream Provider
+    participant LF as Langfuse
     participant AUDIT as AuditService (Postgres)
 
     C->>API: POST /v1/chat/completions (stream=false)
@@ -46,11 +47,13 @@ sequenceDiagram
     RT->>LEASE: acquire(instance_id, request_id)
     LEASE-->>RT: acquired
     RT-->>API: routing decision
+    API->>LF: start trace/generation
     API->>UP: proxy JSON request
     alt pre-first-token upstream failure
         API->>UP: retry once (MVP)
     end
     UP-->>API: OpenAI-compatible JSON
+    API->>LF: finalize success/failure
     API->>LEASE: release in finally
     API->>AUDIT: write request log
     API-->>C: upstream status + JSON body
@@ -70,6 +73,7 @@ sequenceDiagram
     participant LEASE as LeaseManager (Redis)
     participant UP as Upstream Provider
     participant STREAM as SSE Wrapper
+    participant LF as Langfuse
     participant AUDIT as AuditService (Postgres)
 
     C->>API: POST /v1/chat/completions (stream=true)
@@ -80,6 +84,7 @@ sequenceDiagram
     API->>RT: resolve alias + candidate
     RT->>LEASE: acquire
     LEASE-->>RT: acquired
+    API->>LF: start trace/generation
     API->>UP: open upstream SSE stream
     API->>STREAM: wrap stream (TTFT/usage extraction)
     loop for each SSE chunk
@@ -88,6 +93,7 @@ sequenceDiagram
     end
     UP-->>STREAM: data: [DONE]
     STREAM-->>C: data: [DONE]
+    API->>LF: finalize stream status/ttft/usage
     API->>LEASE: release in finally
     API->>AUDIT: write request log (latency/ttft/usage)
 ```
@@ -105,6 +111,7 @@ sequenceDiagram
     participant RT as RouterService
     participant LEASE as LeaseManager (Redis)
     participant UP as Upstream Provider
+    participant LF as Langfuse
     participant AUDIT as AuditService (Postgres)
 
     C->>API: POST /v1/embeddings
@@ -113,8 +120,10 @@ sequenceDiagram
     API->>RL: check RPM/TPM
     API->>RT: resolve alias + candidate
     RT->>LEASE: acquire
+    API->>LF: start trace/generation
     API->>UP: proxy embeddings request
     UP-->>API: embeddings response
+    API->>LF: finalize success/failure
     API->>LEASE: release in finally
     API->>AUDIT: write request log
     API-->>C: upstream status + embeddings JSON
@@ -134,3 +143,8 @@ All endpoint failures are returned in OpenAI-compatible shape:
   }
 }
 ```
+
+## Admin Graph Consumption
+
+`airgap_backend` consumes `llm_gateway_request_log` from the `llm_api` database to power `/api/llm/graph/traces` and `/api/llm/graph/traces/stream`.
+The frontend visualizer (`/admin/llm/graph`) subscribes to backend SSE only; it never calls Langfuse directly.

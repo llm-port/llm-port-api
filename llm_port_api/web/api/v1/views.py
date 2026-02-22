@@ -13,6 +13,7 @@ from llm_port_api.services.gateway.audit import AuditService
 from llm_port_api.services.gateway.auth import AuthContext, get_auth_context
 from llm_port_api.services.gateway.errors import GatewayError, error_response
 from llm_port_api.services.gateway.lease import LeaseManager
+from llm_port_api.services.gateway.observability import GatewayObservability
 from llm_port_api.services.gateway.proxy import UpstreamProxy
 from llm_port_api.services.gateway.ratelimit import RateLimiter
 from llm_port_api.services.gateway.routing import RouterService
@@ -43,12 +44,14 @@ def get_gateway_service(
     proxy = UpstreamProxy(timeout_sec=settings.http_timeout_sec)
     limiter = RateLimiter(redis_pool)
     audit = AuditService(dao)
+    observability: GatewayObservability = request.app.state.gateway_observability
     return GatewayService(
         dao=dao,
         router=router_service,
         proxy=proxy,
         limiter=limiter,
         audit=audit,
+        observability=observability,
     )
 
 
@@ -91,6 +94,8 @@ async def create_embeddings(
         response = JSONResponse(status_code=routed.status_code, content=routed.payload)
         response.headers["x-request-id"] = request_id
         response.headers["x-provider-instance-id"] = routed.provider_instance_id
+        if routed.trace_id:
+            response.headers["x-langfuse-trace-id"] = routed.trace_id
         return response
     except GatewayError as exc:
         return error_response(
@@ -129,6 +134,8 @@ async def create_chat_completions(
                 streamed.provider_instance_id
             )
             stream_response.headers["cache-control"] = "no-cache"
+            if streamed.trace_id:
+                stream_response.headers["x-langfuse-trace-id"] = streamed.trace_id
             return stream_response
 
         non_stream = await service.route_non_stream(
@@ -144,6 +151,8 @@ async def create_chat_completions(
         json_response.headers["x-provider-instance-id"] = (
             non_stream.provider_instance_id
         )
+        if non_stream.trace_id:
+            json_response.headers["x-langfuse-trace-id"] = non_stream.trace_id
         return json_response
     except GatewayError as exc:
         return error_response(

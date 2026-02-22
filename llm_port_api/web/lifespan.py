@@ -21,6 +21,7 @@ from prometheus_fastapi_instrumentator.instrumentation import (
 )
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from llm_port_api.services.gateway.observability import GatewayObservability
 from llm_port_api.services.rabbit.lifespan import init_rabbit, shutdown_rabbit
 from llm_port_api.services.redis.lifespan import init_redis, shutdown_redis
 from llm_port_api.settings import settings
@@ -121,6 +122,18 @@ def _setup_db(app: FastAPI) -> None:  # pragma: no cover
     app.state.db_session_factory = session_factory
 
 
+def _setup_gateway_observability(app: FastAPI) -> None:
+    app.state.gateway_observability = GatewayObservability(
+        enabled=settings.langfuse_enabled,
+        host=settings.langfuse_host,
+        public_key=settings.langfuse_public_key,
+        secret_key=settings.langfuse_secret_key,
+        tracing_enabled=settings.langfuse_tracing_enabled,
+        release=settings.langfuse_release,
+        debug=settings.langfuse_debug,
+    )
+
+
 @asynccontextmanager
 async def lifespan_setup(
     app: FastAPI,
@@ -139,6 +152,7 @@ async def lifespan_setup(
     if not broker.is_worker_process:
         await broker.startup()
     _setup_db(app)
+    _setup_gateway_observability(app)
     setup_opentelemetry(app)
     init_redis(app)
     init_rabbit(app)
@@ -149,6 +163,7 @@ async def lifespan_setup(
     if not broker.is_worker_process:
         await broker.shutdown()
     await app.state.db_engine.dispose()
+    app.state.gateway_observability.shutdown()
     await shutdown_redis(app)
     await shutdown_rabbit(app)
     stop_opentelemetry(app)

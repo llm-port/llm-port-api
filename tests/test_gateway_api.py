@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 import jwt
 import pytest
+from fastapi import FastAPI
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +19,7 @@ from llm_port_api.db.models.gateway import (
     ProviderType,
     TenantLLMPolicy,
 )
+from llm_port_api.services.gateway.observability import GatewayTraceContext
 from llm_port_api.services.gateway.proxy import UpstreamProxy, UpstreamResult
 
 TEST_JWT_SECRET = "test-secret-32-bytes-minimum-value"
@@ -73,6 +75,25 @@ async def _seed_basic_graph(session: AsyncSession) -> uuid.UUID:
     return instance_id
 
 
+class _FakeObservability:
+    def start_request_trace(self, **kwargs: object) -> GatewayTraceContext:  # noqa: ARG002
+        return GatewayTraceContext(
+            trace_id="trace-test-123",
+            observation=None,
+            endpoint="/v1/chat/completions",
+            privacy_mode=PrivacyMode.METADATA_ONLY,
+        )
+
+    def record_success(self, *args: object, **kwargs: object) -> None:  # noqa: ARG002
+        return
+
+    def record_failure(self, *args: object, **kwargs: object) -> None:  # noqa: ARG002
+        return
+
+    def finalize_stream(self, *args: object, **kwargs: object) -> None:  # noqa: ARG002
+        return
+
+
 @pytest.mark.anyio
 async def test_auth_missing_token_returns_401(client: AsyncClient) -> None:
     response = await client.get("/v1/models")
@@ -114,11 +135,13 @@ async def test_models_list_applies_tenant_allowlist(
 
 @pytest.mark.anyio
 async def test_chat_non_stream_passthrough_and_retry_once(
+    fastapi_app: FastAPI,
     client: AsyncClient,
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await _seed_basic_graph(db_session)
+    fastapi_app.state.gateway_observability = _FakeObservability()
     token = _token()
     calls = {"count": 0}
 
@@ -165,15 +188,18 @@ async def test_chat_non_stream_passthrough_and_retry_once(
     body = response.json()
     assert body["object"] == "chat.completion"
     assert calls["count"] == 2
+    assert response.headers["x-langfuse-trace-id"] == "trace-test-123"
 
 
 @pytest.mark.anyio
 async def test_chat_stream_sse_done(
+    fastapi_app: FastAPI,
     client: AsyncClient,
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await _seed_basic_graph(db_session)
+    fastapi_app.state.gateway_observability = _FakeObservability()
     token = _token()
 
     async def fake_stream_post(
@@ -196,6 +222,7 @@ async def test_chat_stream_sse_done(
     )
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["x-langfuse-trace-id"] == "trace-test-123"
     text = response.text
     assert "chat.completion.chunk" in text
     assert "data: [DONE]" in text
@@ -203,11 +230,13 @@ async def test_chat_stream_sse_done(
 
 @pytest.mark.anyio
 async def test_embeddings_passthrough(
+    fastapi_app: FastAPI,
     client: AsyncClient,
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await _seed_basic_graph(db_session)
+    fastapi_app.state.gateway_observability = _FakeObservability()
     token = _token()
 
     async def fake_post_json(
@@ -234,8 +263,10 @@ async def test_embeddings_passthrough(
     body = response.json()
     assert body["object"] == "list"
     assert body["data"][0]["object"] == "embedding"
+    assert response.headers["x-langfuse-trace-id"] == "trace-test-123"
     rows = (await db_session.execute(select(LLMGatewayRequestLog))).scalars().all()
     assert len(rows) >= 1
+    assert rows[-1].trace_id == "trace-test-123"
 
 
 @pytest.mark.anyio

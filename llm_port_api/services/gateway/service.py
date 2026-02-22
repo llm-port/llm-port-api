@@ -9,6 +9,9 @@ from llm_port_api.db.dao.gateway_dao import GatewayDAO
 from llm_port_api.services.gateway.audit import AuditService
 from llm_port_api.services.gateway.auth import AuthContext
 from llm_port_api.services.gateway.errors import GatewayError
+from llm_port_api.services.gateway.observability import (
+    GatewayObservability,
+)
 from llm_port_api.services.gateway.proxy import UpstreamProxy, UpstreamResult
 from llm_port_api.services.gateway.ratelimit import RateLimiter
 from llm_port_api.services.gateway.routing import RouterService
@@ -28,6 +31,7 @@ class GatewayResponse:
     payload: dict[str, Any]
     provider_instance_id: str
     latency_ms: int
+    trace_id: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -38,6 +42,7 @@ class StreamingGatewayResponse:
     provider_instance_id: str
     latency_ms: int
     stats: StreamStats
+    trace_id: str | None = None
 
 
 class GatewayService:
@@ -51,12 +56,14 @@ class GatewayService:
         proxy: UpstreamProxy,
         limiter: RateLimiter,
         audit: AuditService,
+        observability: GatewayObservability,
     ) -> None:
         self.dao = dao
         self.router = router
         self.proxy = proxy
         self.limiter = limiter
         self.audit = audit
+        self.observability = observability
 
     async def list_models(self, auth: AuthContext) -> dict[str, Any]:
         aliases = await self.dao.list_enabled_aliases_for_tenant(auth.tenant_id)
@@ -105,6 +112,16 @@ class GatewayService:
         usage_prompt = None
         usage_completion = None
         usage_total = None
+        trace_context = self.observability.start_request_trace(
+            request_id=request_id,
+            tenant_id=auth.tenant_id,
+            user_id=auth.user_id,
+            endpoint=endpoint,
+            model_alias=model_alias,
+            payload=payload,
+            privacy_mode=policy.privacy_mode if policy else None,
+            stream=False,
+        )
         try:
             for attempt in range(settings.retry_pre_first_token + 1):
                 try:
@@ -134,21 +151,42 @@ class GatewayService:
             usage_prompt = usage.prompt_tokens
             usage_completion = usage.completion_tokens
             usage_total = usage.total_tokens
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            self.observability.record_success(
+                trace_context,
+                status_code=result.status_code,
+                latency_ms=latency_ms,
+                ttft_ms=None,
+                prompt_tokens=usage_prompt,
+                completion_tokens=usage_completion,
+                total_tokens=usage_total,
+                provider_instance_id=str(decision.candidate.instance_id),
+                output_payload=result.payload,
+            )
             return GatewayResponse(
                 status_code=result.status_code,
                 payload=result.payload,
                 provider_instance_id=str(decision.candidate.instance_id),
-                latency_ms=int((time.perf_counter() - started) * 1000),
+                latency_ms=latency_ms,
+                trace_id=trace_context.trace_id,
             )
         except GatewayError as exc:
             error_code = exc.code
             status_code = exc.status_code
+            self.observability.record_failure(
+                trace_context,
+                status_code=exc.status_code,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                provider_instance_id=str(decision.candidate.instance_id),
+                error_code=exc.code,
+                error_message=exc.message,
+            )
             raise
         finally:
             await self.router.release(decision)
             await self.audit.log(
                 request_id=request_id,
-                trace_id=None,
+                trace_id=trace_context.trace_id,
                 tenant_id=auth.tenant_id,
                 user_id=auth.user_id,
                 model_alias=model_alias,
@@ -188,6 +226,16 @@ class GatewayService:
         decision = await self.router.pick_and_lease(
             candidates=candidates, request_id=request_id,
         )
+        trace_context = self.observability.start_request_trace(
+            request_id=request_id,
+            tenant_id=auth.tenant_id,
+            user_id=auth.user_id,
+            endpoint=endpoint,
+            model_alias=model_alias,
+            payload=payload,
+            privacy_mode=policy.privacy_mode if policy else None,
+            stream=True,
+        )
         raw_stream = self.proxy.stream_post(
             base_url=decision.candidate.base_url,
             path=endpoint,
@@ -211,7 +259,7 @@ class GatewayService:
                 await self.router.release(decision)
                 await self.audit.log(
                     request_id=request_id,
-                    trace_id=None,
+                    trace_id=trace_context.trace_id,
                     tenant_id=auth.tenant_id,
                     user_id=auth.user_id,
                     model_alias=model_alias,
@@ -225,12 +273,24 @@ class GatewayService:
                     total_tokens=stats.usage.total_tokens,
                     error_code=error_code,
                 )
+                self.observability.finalize_stream(
+                    trace_context,
+                    status_code=status_code,
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    ttft_ms=stats.ttft_ms,
+                    prompt_tokens=stats.usage.prompt_tokens,
+                    completion_tokens=stats.usage.completion_tokens,
+                    total_tokens=stats.usage.total_tokens,
+                    provider_instance_id=str(decision.candidate.instance_id),
+                    error_code=error_code,
+                )
 
         return StreamingGatewayResponse(
             stream=_stream_with_finalize(),
             provider_instance_id=str(decision.candidate.instance_id),
             latency_ms=int((time.perf_counter() - started) * 1000),
             stats=stats,
+            trace_id=trace_context.trace_id,
         )
 
 

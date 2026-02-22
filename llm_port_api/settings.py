@@ -89,6 +89,15 @@ class Settings(BaseSettings):
     request_max_body_bytes: int = 2 * 1024 * 1024
     stream_idle_timeout_sec: float = 60.0
 
+    # Langfuse observability
+    langfuse_enabled: bool = False
+    langfuse_host: str | None = None
+    langfuse_public_key: str | None = None
+    langfuse_secret_key: str | None = None
+    langfuse_tracing_enabled: bool = True
+    langfuse_release: str | None = None
+    langfuse_debug: bool = False
+
     @property
     def db_url(self) -> URL:
         """

@@ -21,11 +21,21 @@
 9. Retry once if non-stream upstream call fails before first token.
 10. Release lease in `finally`.
 11. Write audit row to `llm_gateway_request_log`.
+12. Emit Langfuse trace/generation events for chat and embeddings.
 
 ## Streaming
 - Streaming chat uses SSE passthrough.
 - Gateway preserves upstream `data:` chunk payloads and forwards `[DONE]`.
 - TTFT and usage are extracted when present and written to audit logs.
+- TTFT, usage, status, and latency are finalized to Langfuse.
+
+## Langfuse
+- Langfuse is integrated at gateway level so all `/v1/chat/completions` and `/v1/embeddings` calls are observed.
+- Trace metadata includes `request_id`, `tenant_id`, `user_id`, endpoint, model alias, and provider instance id.
+- Payload capture is controlled by tenant `privacy_mode`:
+  - `full`: full prompt/output (except embedding vectors).
+  - `redacted`: content redacted, structure and lengths preserved.
+  - `metadata_only`: content omitted, only metadata/timing/usage/error recorded.
 
 ## Compatibility Strategy
 - Permissive passthrough for optional OpenAI request keys.
