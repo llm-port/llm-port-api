@@ -146,5 +146,5 @@ All endpoint failures are returned in OpenAI-compatible shape:
 
 ## Admin Graph Consumption
 
-`airgap_backend` consumes `llm_gateway_request_log` from the `llm_api` database to power `/api/llm/graph/traces` and `/api/llm/graph/traces/stream`.
+`llm_port_backend` consumes `llm_gateway_request_log` from the `llm_api` database to power `/api/llm/graph/traces` and `/api/llm/graph/traces/stream`.
 The frontend visualizer (`/admin/llm/graph`) subscribes to backend SSE only; it never calls Langfuse directly.

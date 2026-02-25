@@ -20,7 +20,7 @@ Swagger UI:
 - `/api/docs`
 
 ## Docker Compose (Shared Stack)
-From `airgap_shared/`:
+From `llm_port_shared/`:
 ```bash
 # Normal containerized run
 docker compose up -d llm-port-api
