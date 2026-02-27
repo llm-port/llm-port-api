@@ -14,6 +14,7 @@ from llm_port_api.services.gateway.auth import AuthContext, get_auth_context
 from llm_port_api.services.gateway.errors import GatewayError, error_response
 from llm_port_api.services.gateway.lease import LeaseManager
 from llm_port_api.services.gateway.observability import GatewayObservability
+from llm_port_api.services.gateway.pii_client import PIIClient
 from llm_port_api.services.gateway.proxy import UpstreamProxy
 from llm_port_api.services.gateway.ratelimit import RateLimiter
 from llm_port_api.services.gateway.routing import RouterService
@@ -48,6 +49,15 @@ def get_gateway_service(
     limiter = RateLimiter(redis_pool)
     audit = AuditService(dao)
     observability: GatewayObservability = request.app.state.gateway_observability
+
+    # PII client (optional - only when pii_service_url is configured)
+    pii_client: PIIClient | None = None
+    if settings.pii_service_url:
+        pii_client = PIIClient(
+            base_url=settings.pii_service_url,
+            http_client=request.app.state.http_client,
+        )
+
     return GatewayService(
         dao=dao,
         router=router_service,
@@ -55,6 +65,7 @@ def get_gateway_service(
         limiter=limiter,
         audit=audit,
         observability=observability,
+        pii_client=pii_client,
     )
 
 

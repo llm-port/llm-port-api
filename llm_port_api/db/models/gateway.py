@@ -143,7 +143,7 @@ class LLMPoolMembership(Base):
 
 
 class TenantLLMPolicy(Base):
-    """Tenant policy controls model/provider access and limits."""
+    """Tenant policy controls model/provider access, limits and PII."""
 
     __tablename__ = "tenant_llm_policy"
 
@@ -164,6 +164,19 @@ class TenantLLMPolicy(Base):
     )
     rpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # ----- PII policy (nullable = feature disabled) -----
+    pii_config: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON,
+        nullable=True,
+        doc=(
+            "JSON PII policy: "
+            "{telemetry: {enabled, mode, store_raw}, "
+            " egress: {enabled_for_cloud, enabled_for_local, mode, fail_action}, "
+            " presidio: {language, threshold, entities}}"
+        ),
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

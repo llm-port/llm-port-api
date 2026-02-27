@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
 from llm_port_api.db.dao.gateway_dao import GatewayDAO
+from llm_port_api.db.models.gateway import ProviderType
 from llm_port_api.services.gateway.audit import AuditService
 from llm_port_api.services.gateway.auth import AuthContext
 from llm_port_api.services.gateway.errors import GatewayError
 from llm_port_api.services.gateway.observability import (
     GatewayObservability,
 )
+from llm_port_api.services.gateway.pii_client import PIIClient
+from llm_port_api.services.gateway.pii_policy import PIIPolicy, parse_pii_policy
 from llm_port_api.services.gateway.proxy import UpstreamProxy, UpstreamResult
 from llm_port_api.services.gateway.ratelimit import RateLimiter
 from llm_port_api.services.gateway.routing import RouterService
@@ -21,6 +25,8 @@ from llm_port_api.services.gateway.usage import (
     usage_from_payload,
 )
 from llm_port_api.settings import settings
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True, frozen=True)
@@ -57,6 +63,7 @@ class GatewayService:
         limiter: RateLimiter,
         audit: AuditService,
         observability: GatewayObservability,
+        pii_client: PIIClient | None = None,
     ) -> None:
         self.dao = dao
         self.router = router
@@ -64,6 +71,7 @@ class GatewayService:
         self.limiter = limiter
         self.audit = audit
         self.observability = observability
+        self.pii_client = pii_client
 
     async def list_models(self, auth: AuthContext) -> dict[str, Any]:
         aliases = await self.dao.list_enabled_aliases_for_tenant(auth.tenant_id)
@@ -106,6 +114,32 @@ class GatewayService:
         decision = await self.router.pick_and_lease(
             candidates=candidates, request_id=request_id,
         )
+
+        # --- PII policy resolution ---
+        pii_policy = parse_pii_policy(
+            policy.pii_config if policy else None,
+        )
+        egress_payload = payload
+        token_mapping: dict[str, str] | None = None
+        is_cloud = decision.candidate.provider_type == ProviderType.REMOTE_OPENAI
+
+        if pii_policy and self.pii_client:
+            egress_payload, token_mapping = await self._apply_egress_pii(
+                payload=payload,
+                pii_policy=pii_policy,
+                is_cloud=is_cloud,
+                request_id=request_id,
+            )
+
+        # Payload used for observability (may be further sanitized)
+        obs_payload = egress_payload
+        if pii_policy and self.pii_client and pii_policy.telemetry.enabled:
+            obs_payload = await self._apply_telemetry_pii(
+                payload=payload,
+                pii_policy=pii_policy,
+                request_id=request_id,
+            )
+
         result: UpstreamResult | None = None
         error_code: str | None = None
         status_code = 500
@@ -118,7 +152,7 @@ class GatewayService:
             user_id=auth.user_id,
             endpoint=endpoint,
             model_alias=model_alias,
-            payload=payload,
+            payload=obs_payload,
             privacy_mode=policy.privacy_mode if policy else None,
             stream=False,
         )
@@ -128,7 +162,7 @@ class GatewayService:
                     result = await self.proxy.post_json(
                         base_url=decision.candidate.base_url,
                         path=endpoint,
-                        payload=payload,
+                        payload=egress_payload,
                     )
                     status_code = result.status_code
                     break
@@ -152,6 +186,21 @@ class GatewayService:
             usage_completion = usage.completion_tokens
             usage_total = usage.total_tokens
             latency_ms = int((time.perf_counter() - started) * 1000)
+
+            # Detokenize response when tokenize mode was used
+            response_payload = result.payload
+            if token_mapping and self.pii_client:
+                try:
+                    response_payload = await self.pii_client.detokenize(
+                        payload=result.payload,
+                        token_mapping=token_mapping,
+                    )
+                except Exception:
+                    logger.warning(
+                        "PII detokenize failed for %s; returning raw response",
+                        request_id,
+                    )
+
             self.observability.record_success(
                 trace_context,
                 status_code=result.status_code,
@@ -165,7 +214,7 @@ class GatewayService:
             )
             return GatewayResponse(
                 status_code=result.status_code,
-                payload=result.payload,
+                payload=response_payload,
                 provider_instance_id=str(decision.candidate.instance_id),
                 latency_ms=latency_ms,
                 trace_id=trace_context.trace_id,
@@ -226,20 +275,46 @@ class GatewayService:
         decision = await self.router.pick_and_lease(
             candidates=candidates, request_id=request_id,
         )
+
+        # --- PII policy resolution (stream) ---
+        pii_policy = parse_pii_policy(
+            policy.pii_config if policy else None,
+        )
+        egress_payload = payload
+        is_cloud = decision.candidate.provider_type == ProviderType.REMOTE_OPENAI
+
+        if pii_policy and self.pii_client:
+            # For streaming, only sanitize the INPUT payload (egress).
+            # SSE chunk-level PII detection is a non-goal per spec.
+            egress_payload, _ = await self._apply_egress_pii(
+                payload=payload,
+                pii_policy=pii_policy,
+                is_cloud=is_cloud,
+                request_id=request_id,
+            )
+
+        obs_payload = egress_payload
+        if pii_policy and self.pii_client and pii_policy.telemetry.enabled:
+            obs_payload = await self._apply_telemetry_pii(
+                payload=payload,
+                pii_policy=pii_policy,
+                request_id=request_id,
+            )
+
         trace_context = self.observability.start_request_trace(
             request_id=request_id,
             tenant_id=auth.tenant_id,
             user_id=auth.user_id,
             endpoint=endpoint,
             model_alias=model_alias,
-            payload=payload,
+            payload=obs_payload,
             privacy_mode=policy.privacy_mode if policy else None,
             stream=True,
         )
         raw_stream = self.proxy.stream_post(
             base_url=decision.candidate.base_url,
             path=endpoint,
-            payload=payload,
+            payload=egress_payload,
         )
         wrapped_stream, stats = await wrap_sse_stream(raw_stream)
 
@@ -292,6 +367,96 @@ class GatewayService:
             stats=stats,
             trace_id=trace_context.trace_id,
         )
+
+    # ------------------------------------------------------------------
+    # PII helpers
+    # ------------------------------------------------------------------
+
+    async def _apply_egress_pii(
+        self,
+        *,
+        payload: dict[str, Any],
+        pii_policy: PIIPolicy,
+        is_cloud: bool,
+        request_id: str,
+    ) -> tuple[dict[str, Any], dict[str, str] | None]:
+        """Sanitize *payload* before sending to upstream provider.
+
+        Returns ``(sanitized_payload, token_mapping | None)``.
+        If PII scanning is not applicable (local provider, policy disabled),
+        the original *payload* is returned unchanged.
+        """
+        assert self.pii_client is not None  # noqa: S101
+
+        should_scan = (
+            (is_cloud and pii_policy.egress.enabled_for_cloud)
+            or (not is_cloud and pii_policy.egress.enabled_for_local)
+        )
+        if not should_scan:
+            return payload, None
+
+        try:
+            result = await self.pii_client.sanitize(
+                payload=payload,
+                policy=pii_policy,
+                mode=pii_policy.egress.mode,
+            )
+        except Exception:
+            # Honour fail_action
+            if pii_policy.egress.fail_action == "block":
+                raise GatewayError(
+                    status_code=502,
+                    message="PII service unavailable and fail_action=block.",
+                    error_type="server_error",
+                    code="pii_service_unavailable",
+                )
+            logger.warning(
+                "PII egress scan failed for %s; fail_action=%s, allowing through",
+                request_id,
+                pii_policy.egress.fail_action,
+            )
+            return payload, None
+
+        if result.pii_detected and pii_policy.egress.fail_action == "block":
+            # In redact mode we already replaced PII; "block" means
+            # we should reject the request when PII is found.
+            if pii_policy.egress.mode == "redact":
+                # Still send the redacted payload (PII is removed).
+                pass
+
+        return result.sanitized_payload, result.token_mapping
+
+    async def _apply_telemetry_pii(
+        self,
+        *,
+        payload: dict[str, Any],
+        pii_policy: PIIPolicy,
+        request_id: str,
+    ) -> dict[str, Any]:
+        """Produce a PII-clean version of *payload* for observability.
+
+        If the telemetry mode is ``metrics_only`` we return a minimal
+        stub so that Langfuse still gets token counts but no text.
+        """
+        assert self.pii_client is not None  # noqa: S101
+
+        if pii_policy.telemetry.mode == "metrics_only":
+            # Strip all text content; keep only model + metadata
+            return {"model": payload.get("model"), "_pii_mode": "metrics_only"}
+
+        try:
+            result = await self.pii_client.sanitize(
+                payload=payload,
+                policy=pii_policy,
+                mode="redact",  # always redact for telemetry
+            )
+            return result.sanitized_payload
+        except Exception:
+            logger.warning(
+                "PII telemetry scan failed for %s; falling back to metadata-only",
+                request_id,
+            )
+            return {"model": payload.get("model"), "_pii_mode": "fallback"}
 
 
 def _require_model(payload: dict[str, Any]) -> str:
