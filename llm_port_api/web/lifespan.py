@@ -148,10 +148,8 @@ def _setup_service_registry(app: FastAPI) -> None:
     service_registry.configure(
         "auth", enabled=settings.auth_enabled, url=settings.auth_service_url,
     )
-    # RAG is always configured via the backend, but we expose its
-    # status here for the frontend manifest.
     service_registry.configure(
-        "rag", enabled=True, url=None,  # RAG lives behind the backend
+        "rag", enabled=settings.rag_enabled, url=settings.rag_service_url,
     )
     app.state.service_registry = service_registry
 

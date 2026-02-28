@@ -107,6 +107,10 @@ class Settings(BaseSettings):
     auth_service_url: str | None = None
     auth_enabled: bool = False
 
+    # Optional module: RAG engine (exposed via backend, status tracked here)
+    rag_service_url: str | None = None
+    rag_enabled: bool = False
+
     langfuse_debug: bool = False
 
     @property
