@@ -23,6 +23,7 @@ from llm_port_api.services.gateway.schemas import (
     EmbeddingsRequest,
 )
 from llm_port_api.services.gateway.service import GatewayService
+from llm_port_api.services.registry import service_registry
 from llm_port_api.settings import settings
 
 router = APIRouter()
@@ -31,6 +32,19 @@ router = APIRouter()
 @router.get("/health")
 def public_health_check() -> None:
     """Public health endpoint for L7 probes."""
+
+
+@router.get("/v1/services")
+async def list_services(request: Request) -> JSONResponse:
+    """Return the manifest of optional service modules.
+
+    The frontend uses this to discover which features (PII, Auth, RAG, ...)
+    are available and healthy so it can show/hide UI sections accordingly.
+    """
+    registry = request.app.state.service_registry
+    # Run async health checks against enabled services
+    await registry.check_health(request.app.state.http_client)
+    return JSONResponse(status_code=200, content=registry.to_dict())
 
 
 def get_gateway_service(
@@ -50,11 +64,12 @@ def get_gateway_service(
     audit = AuditService(dao)
     observability: GatewayObservability = request.app.state.gateway_observability
 
-    # PII client (optional - only when pii_service_url is configured)
+    # PII client (optional - only when PII module is enabled in registry)
     pii_client: PIIClient | None = None
-    if settings.pii_service_url:
+    pii_url = service_registry.get_url("pii")
+    if pii_url:
         pii_client = PIIClient(
-            base_url=settings.pii_service_url,
+            base_url=pii_url,
             http_client=request.app.state.http_client,
         )
 

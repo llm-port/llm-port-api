@@ -99,9 +99,14 @@ class Settings(BaseSettings):
     langfuse_tracing_enabled: bool = True
     langfuse_release: str | None = None
 
-    # PII service
+    # Optional module: PII service
     pii_service_url: str | None = None
-    pii_scan_enabled: bool = False
+    pii_enabled: bool = False
+
+    # Optional module: External auth service
+    auth_service_url: str | None = None
+    auth_enabled: bool = False
+
     langfuse_debug: bool = False
 
     @property

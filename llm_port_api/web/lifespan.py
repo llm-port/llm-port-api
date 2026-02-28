@@ -25,6 +25,7 @@ from llm_port_api.services.gateway.observability import GatewayObservability
 from llm_port_api.services.gateway.proxy import create_shared_http_client
 from llm_port_api.services.rabbit.lifespan import init_rabbit, shutdown_rabbit
 from llm_port_api.services.redis.lifespan import init_redis, shutdown_redis
+from llm_port_api.services.registry import service_registry
 from llm_port_api.settings import settings
 from llm_port_api.tkq import broker
 
@@ -135,6 +136,26 @@ def _setup_gateway_observability(app: FastAPI) -> None:
     )
 
 
+def _setup_service_registry(app: FastAPI) -> None:
+    """Configure the modular service registry from env-vars.
+
+    Each optional service is "enabled" when *both* its feature flag
+    (``<name>_enabled``) is ``True`` **and** its URL is set.
+    """
+    service_registry.configure(
+        "pii", enabled=settings.pii_enabled, url=settings.pii_service_url,
+    )
+    service_registry.configure(
+        "auth", enabled=settings.auth_enabled, url=settings.auth_service_url,
+    )
+    # RAG is always configured via the backend, but we expose its
+    # status here for the frontend manifest.
+    service_registry.configure(
+        "rag", enabled=True, url=None,  # RAG lives behind the backend
+    )
+    app.state.service_registry = service_registry
+
+
 @asynccontextmanager
 async def lifespan_setup(
     app: FastAPI,
@@ -154,6 +175,7 @@ async def lifespan_setup(
         await broker.startup()
     _setup_db(app)
     _setup_gateway_observability(app)
+    _setup_service_registry(app)
     app.state.http_client = create_shared_http_client(
         timeout_sec=settings.http_timeout_sec,
     )
