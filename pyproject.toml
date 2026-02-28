@@ -3,10 +3,10 @@ name = "llm_port_api"
 version = "0.1.0"
 description = ""
 authors = [
-
+  "Sachith Liyanagama <liyanagama@outlook.de>",
 ]
 maintainers = [
-
+  "Sachith Liyanagama <liyanagama@outlook.de>",
 ]
 readme = "README.md"
 
