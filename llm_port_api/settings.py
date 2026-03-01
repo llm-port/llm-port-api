@@ -170,6 +170,7 @@ class Settings(BaseSettings):
         env_file=(".env", "llm_port_api/.env"),
         env_prefix="LLM_PORT_API_",
         env_file_encoding="utf-8",
+        extra="ignore",
     )
 
 
