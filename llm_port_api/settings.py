@@ -85,9 +85,10 @@ class Settings(BaseSettings):
     jwt_issuer: str = ""
 
     # If set, jwt_secret is loaded from backend's system_setting_secret table at startup
-    # (same PostgreSQL host/user/pass, different database).  Both must be provided together.
-    backend_db_base: str = ""           # e.g. "llm_port_backend"
-    settings_master_key: str = ""       # matches LLM_PORT_BACKEND_SETTINGS_MASTER_KEY
+    # (same PostgreSQL host/user/pass, different database).
+    # Defaults match local dev bootstrap values; override in production.
+    backend_db_base: str = "llm_port_backend"
+    settings_master_key: str = "dev-settings-master-key-change-me"
 
     # Gateway behavior
     http_timeout_sec: float = 30.0
