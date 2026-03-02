@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import jwt
-from fastapi import Header
+from fastapi import Depends
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from llm_port_api.services.gateway.errors import GatewayError
 from llm_port_api.settings import settings
@@ -19,27 +20,9 @@ class AuthContext:
     raw_claims: dict[str, Any]
 
 
-def _parse_bearer(auth_header: str | None) -> str:
-    if not auth_header:
-        raise GatewayError(
-            status_code=401,
-            message="Missing Authorization header.",
-            code="missing_authorization",
-        )
-    if not auth_header.startswith("Bearer "):
-        raise GatewayError(
-            status_code=401,
-            message="Authorization header must be a Bearer token.",
-            code="invalid_authorization_header",
-        )
-    token = auth_header[len("Bearer ") :].strip()
-    if not token:
-        raise GatewayError(
-            status_code=401,
-            message="Bearer token is empty.",
-            code="invalid_authorization_header",
-        )
-    return token
+# auto_error=False so we can return our own structured error response
+# instead of FastAPI's default 403.
+_bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def verify_token(token: str) -> dict[str, Any]:
@@ -92,8 +75,20 @@ def get_auth_context_from_claims(claims: dict[str, Any]) -> AuthContext:
     return AuthContext(user_id=user_id, tenant_id=tenant_id, raw_claims=claims)
 
 
-def get_auth_context(authorization: str | None = Header(default=None)) -> AuthContext:
-    """FastAPI dependency that validates JWT bearer token."""
-    token = _parse_bearer(authorization)
+def get_auth_context(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> AuthContext:
+    """FastAPI dependency that validates JWT bearer token.
+
+    Using HTTPBearer ensures Swagger UI shows the Authorize button and
+    correctly includes the token in the Authorization: Bearer <token> header.
+    """
+    token = credentials.credentials if credentials else None
+    if not token:
+        raise GatewayError(
+            status_code=401,
+            message="Missing Authorization header.",
+            code="missing_authorization",
+        )
     claims = verify_token(token)
     return get_auth_context_from_claims(claims)
