@@ -18,7 +18,7 @@ from llm_port_api.services.gateway.pii_client import PIIClient
 from llm_port_api.services.gateway.pii_policy import PIIPolicy, parse_pii_policy
 from llm_port_api.services.gateway.proxy import UpstreamProxy, UpstreamResult
 from llm_port_api.services.gateway.ratelimit import RateLimiter
-from llm_port_api.services.gateway.routing import RouterService
+from llm_port_api.services.gateway.routing import RouterService, RoutingDecision
 from llm_port_api.services.gateway.stream import StreamStats, wrap_sse_stream
 from llm_port_api.services.gateway.usage import (
     estimate_input_tokens,
@@ -27,6 +27,10 @@ from llm_port_api.services.gateway.usage import (
 from llm_port_api.settings import settings
 
 logger = logging.getLogger(__name__)
+
+
+class _PIIFallbackToLocalRequested(Exception):
+    """Signal that cloud egress should be rerouted to a local provider."""
 
 
 @dataclass(slots=True, frozen=True)
@@ -111,54 +115,76 @@ class GatewayService:
         candidates = await self.router.resolve_alias(
             alias=model_alias, tenant_id=auth.tenant_id,
         )
-        decision = await self.router.pick_and_lease(
+        decision: RoutingDecision | None = await self.router.pick_and_lease(
             candidates=candidates, request_id=request_id,
         )
 
-        # --- PII policy resolution ---
-        pii_policy = _resolve_pii_policy(policy)
-        egress_payload = payload
-        token_mapping: dict[str, str] | None = None
-        is_cloud = decision.candidate.provider_type == ProviderType.REMOTE_OPENAI
-
-        if pii_policy and self.pii_client:
-            egress_payload, token_mapping = await self._apply_egress_pii(
-                payload=payload,
-                pii_policy=pii_policy,
-                is_cloud=is_cloud,
-                request_id=request_id,
-            )
-
-        # Payload used for observability (may be further sanitized)
-        obs_payload = egress_payload
-        if pii_policy and self.pii_client and pii_policy.telemetry.enabled:
-            obs_payload = await self._apply_telemetry_pii(
-                payload=payload,
-                pii_policy=pii_policy,
-                request_id=request_id,
-            )
-
         result: UpstreamResult | None = None
+        fallback_outcome = "not_used"
         error_code: str | None = None
         status_code = 500
         usage_prompt = None
         usage_completion = None
         usage_total = None
-        trace_context = self.observability.start_request_trace(
-            request_id=request_id,
-            tenant_id=auth.tenant_id,
-            user_id=auth.user_id,
-            endpoint=endpoint,
-            model_alias=model_alias,
-            payload=obs_payload,
-            privacy_mode=policy.privacy_mode if policy else None,
-            stream=False,
-        )
+        trace_context = None
         try:
+            pii_policy = _resolve_pii_policy(policy)
+            egress_payload = payload
+            token_mapping: dict[str, str] | None = None
+
+            if pii_policy and self.pii_client and decision is not None:
+                try:
+                    egress_payload, token_mapping = await self._apply_egress_pii(
+                        payload=payload,
+                        pii_policy=pii_policy,
+                        is_cloud=self._is_cloud_provider(decision),
+                        request_id=request_id,
+                    )
+                except _PIIFallbackToLocalRequested:
+                    fallback_outcome = "fallback_to_local_attempted"
+                    released_decision = decision
+                    decision = None
+                    try:
+                        decision = await self._fallback_to_local_candidate(
+                            current_decision=released_decision,
+                            candidates=candidates,
+                            request_id=request_id,
+                        )
+                    except GatewayError:
+                        fallback_outcome = "fallback_to_local_failed"
+                        raise
+                    fallback_outcome = "fallback_to_local_succeeded"
+                    egress_payload, token_mapping = await self._apply_egress_pii(
+                        payload=payload,
+                        pii_policy=pii_policy,
+                        is_cloud=False,
+                        request_id=request_id,
+                    )
+
+            obs_payload = egress_payload
+            if pii_policy and self.pii_client and pii_policy.telemetry.enabled:
+                obs_payload = await self._apply_telemetry_pii(
+                    payload=payload,
+                    pii_policy=pii_policy,
+                    request_id=request_id,
+                )
+
+            trace_context = self.observability.start_request_trace(
+                request_id=request_id,
+                tenant_id=auth.tenant_id,
+                user_id=auth.user_id,
+                endpoint=endpoint,
+                model_alias=model_alias,
+                payload=obs_payload,
+                privacy_mode=policy.privacy_mode if policy else None,
+                stream=False,
+                routing_metadata={"pii_fallback_outcome": fallback_outcome},
+            )
+
             for attempt in range(settings.retry_pre_first_token + 1):
                 try:
                     result = await self.proxy.post_json(
-                        base_url=decision.candidate.base_url,
+                        base_url=decision.candidate.base_url,  # type: ignore[union-attr]
                         path=endpoint,
                         payload=egress_payload,
                     )
@@ -199,45 +225,65 @@ class GatewayService:
                         request_id,
                     )
 
-            self.observability.record_success(
-                trace_context,
-                status_code=result.status_code,
-                latency_ms=latency_ms,
-                ttft_ms=None,
-                prompt_tokens=usage_prompt,
-                completion_tokens=usage_completion,
-                total_tokens=usage_total,
-                provider_instance_id=str(decision.candidate.instance_id),
-                output_payload=result.payload,
-            )
+            if trace_context is not None:
+                self.observability.record_success(
+                    trace_context,
+                    status_code=result.status_code,
+                    latency_ms=latency_ms,
+                    ttft_ms=None,
+                    prompt_tokens=usage_prompt,
+                    completion_tokens=usage_completion,
+                    total_tokens=usage_total,
+                    provider_instance_id=(
+                        str(decision.candidate.instance_id) if decision is not None else None
+                    ),
+                    output_payload=result.payload,
+                )
             return GatewayResponse(
                 status_code=result.status_code,
                 payload=response_payload,
-                provider_instance_id=str(decision.candidate.instance_id),
+                provider_instance_id=str(decision.candidate.instance_id),  # type: ignore[union-attr]
                 latency_ms=latency_ms,
-                trace_id=trace_context.trace_id,
+                trace_id=trace_context.trace_id if trace_context is not None else None,
             )
         except GatewayError as exc:
             error_code = exc.code
             status_code = exc.status_code
+            if trace_context is None:
+                trace_context = self.observability.start_request_trace(
+                    request_id=request_id,
+                    tenant_id=auth.tenant_id,
+                    user_id=auth.user_id,
+                    endpoint=endpoint,
+                    model_alias=model_alias,
+                    payload={"model": payload.get("model"), "_pii_mode": "pre_upstream_error"},
+                    privacy_mode=policy.privacy_mode if policy else None,
+                    stream=False,
+                    routing_metadata={"pii_fallback_outcome": fallback_outcome},
+                )
             self.observability.record_failure(
                 trace_context,
                 status_code=exc.status_code,
                 latency_ms=int((time.perf_counter() - started) * 1000),
-                provider_instance_id=str(decision.candidate.instance_id),
+                provider_instance_id=(
+                    str(decision.candidate.instance_id) if decision is not None else None
+                ),
                 error_code=exc.code,
                 error_message=exc.message,
             )
             raise
         finally:
-            await self.router.release(decision)
+            if decision is not None:
+                await self.router.release(decision)
             await self.audit.log(
                 request_id=request_id,
-                trace_id=trace_context.trace_id,
+                trace_id=trace_context.trace_id if trace_context is not None else None,
                 tenant_id=auth.tenant_id,
                 user_id=auth.user_id,
                 model_alias=model_alias,
-                provider_instance_id=str(decision.candidate.instance_id),
+                provider_instance_id=(
+                    str(decision.candidate.instance_id) if decision is not None else None
+                ),
                 endpoint=endpoint,
                 status_code=status_code,
                 latency_ms=int((time.perf_counter() - started) * 1000),
@@ -245,7 +291,11 @@ class GatewayService:
                 prompt_tokens=usage_prompt,
                 completion_tokens=usage_completion,
                 total_tokens=usage_total,
-                error_code=error_code,
+                error_code=error_code or (
+                    "pii_fallback_to_local_succeeded"
+                    if fallback_outcome == "fallback_to_local_succeeded"
+                    else None
+                ),
             )
 
     async def route_stream_chat(
@@ -270,103 +320,240 @@ class GatewayService:
         candidates = await self.router.resolve_alias(
             alias=model_alias, tenant_id=auth.tenant_id,
         )
-        decision = await self.router.pick_and_lease(
+        decision: RoutingDecision | None = await self.router.pick_and_lease(
             candidates=candidates, request_id=request_id,
         )
 
-        # --- PII policy resolution (stream) ---
-        pii_policy = _resolve_pii_policy(policy)
-        egress_payload = payload
-        is_cloud = decision.candidate.provider_type == ProviderType.REMOTE_OPENAI
+        fallback_outcome = "not_used"
+        trace_context = None
+        stream_started = False
+        stats: StreamStats | None = None
+        pre_stream_status_code = 500
+        pre_stream_error_code: str | None = None
+        try:
+            pii_policy = _resolve_pii_policy(policy)
+            egress_payload = payload
 
-        if pii_policy and self.pii_client:
-            # For streaming, only sanitize the INPUT payload (egress).
-            # SSE chunk-level PII detection is a non-goal per spec.
-            egress_payload, _ = await self._apply_egress_pii(
-                payload=payload,
-                pii_policy=pii_policy,
-                is_cloud=is_cloud,
+            if pii_policy and self.pii_client and decision is not None:
+                try:
+                    # For streaming, sanitize only request egress payload.
+                    egress_payload, _ = await self._apply_egress_pii(
+                        payload=payload,
+                        pii_policy=pii_policy,
+                        is_cloud=self._is_cloud_provider(decision),
+                        request_id=request_id,
+                    )
+                except _PIIFallbackToLocalRequested:
+                    fallback_outcome = "fallback_to_local_attempted"
+                    released_decision = decision
+                    decision = None
+                    try:
+                        decision = await self._fallback_to_local_candidate(
+                            current_decision=released_decision,
+                            candidates=candidates,
+                            request_id=request_id,
+                        )
+                    except GatewayError:
+                        fallback_outcome = "fallback_to_local_failed"
+                        raise
+                    fallback_outcome = "fallback_to_local_succeeded"
+                    egress_payload, _ = await self._apply_egress_pii(
+                        payload=payload,
+                        pii_policy=pii_policy,
+                        is_cloud=False,
+                        request_id=request_id,
+                    )
+
+            obs_payload = egress_payload
+            if pii_policy and self.pii_client and pii_policy.telemetry.enabled:
+                obs_payload = await self._apply_telemetry_pii(
+                    payload=payload,
+                    pii_policy=pii_policy,
+                    request_id=request_id,
+                )
+
+            trace_context = self.observability.start_request_trace(
                 request_id=request_id,
+                tenant_id=auth.tenant_id,
+                user_id=auth.user_id,
+                endpoint=endpoint,
+                model_alias=model_alias,
+                payload=obs_payload,
+                privacy_mode=policy.privacy_mode if policy else None,
+                stream=True,
+                routing_metadata={"pii_fallback_outcome": fallback_outcome},
             )
-
-        obs_payload = egress_payload
-        if pii_policy and self.pii_client and pii_policy.telemetry.enabled:
-            obs_payload = await self._apply_telemetry_pii(
-                payload=payload,
-                pii_policy=pii_policy,
-                request_id=request_id,
+            raw_stream = self.proxy.stream_post(
+                base_url=decision.candidate.base_url,  # type: ignore[union-attr]
+                path=endpoint,
+                payload=egress_payload,
             )
+            wrapped_stream, stats = await wrap_sse_stream(raw_stream)
+            stream_started = True
 
-        trace_context = self.observability.start_request_trace(
-            request_id=request_id,
-            tenant_id=auth.tenant_id,
-            user_id=auth.user_id,
-            endpoint=endpoint,
-            model_alias=model_alias,
-            payload=obs_payload,
-            privacy_mode=policy.privacy_mode if policy else None,
-            stream=True,
-        )
-        raw_stream = self.proxy.stream_post(
-            base_url=decision.candidate.base_url,
-            path=endpoint,
-            payload=egress_payload,
-        )
-        wrapped_stream, stats = await wrap_sse_stream(raw_stream)
+            async def _stream_with_finalize() -> AsyncIterator[bytes]:
+                stream_status_code = 200
+                stream_error_code: str | None = None
+                try:
+                    async for chunk in wrapped_stream:
+                        yield chunk
+                except Exception as exc:
+                    stream_status_code = 502
+                    stream_error_code = "upstream_stream_failed"
+                    del exc
+                    # Response has already started; terminate stream gracefully.
+                    yield b"data: [DONE]\n\n"
+                finally:
+                    final_error_code = stream_error_code or (
+                        "pii_fallback_to_local_succeeded"
+                        if fallback_outcome == "fallback_to_local_succeeded"
+                        else None
+                    )
+                    if decision is not None:
+                        await self.router.release(decision)
+                    await self.audit.log(
+                        request_id=request_id,
+                        trace_id=trace_context.trace_id if trace_context is not None else None,
+                        tenant_id=auth.tenant_id,
+                        user_id=auth.user_id,
+                        model_alias=model_alias,
+                        provider_instance_id=(
+                            str(decision.candidate.instance_id) if decision is not None else None
+                        ),
+                        endpoint=endpoint,
+                        status_code=stream_status_code,
+                        latency_ms=int((time.perf_counter() - started) * 1000),
+                        ttft_ms=stats.ttft_ms if stats is not None else None,
+                        prompt_tokens=stats.usage.prompt_tokens if stats is not None else None,
+                        completion_tokens=stats.usage.completion_tokens if stats is not None else None,
+                        total_tokens=stats.usage.total_tokens if stats is not None else None,
+                        error_code=final_error_code,
+                    )
+                    if trace_context is not None:
+                        self.observability.finalize_stream(
+                            trace_context,
+                            status_code=stream_status_code,
+                            latency_ms=int((time.perf_counter() - started) * 1000),
+                            ttft_ms=stats.ttft_ms if stats is not None else None,
+                            prompt_tokens=stats.usage.prompt_tokens if stats is not None else None,
+                            completion_tokens=stats.usage.completion_tokens if stats is not None else None,
+                            total_tokens=stats.usage.total_tokens if stats is not None else None,
+                            provider_instance_id=(
+                                str(decision.candidate.instance_id) if decision is not None else None
+                            ),
+                            error_code=final_error_code,
+                        )
 
-        async def _stream_with_finalize() -> AsyncIterator[bytes]:
-            status_code = 200
-            error_code: str | None = None
-            try:
-                async for chunk in wrapped_stream:
-                    yield chunk
-            except Exception as exc:
-                status_code = 502
-                error_code = "upstream_stream_failed"
-                del exc
-                # Response has already started; terminate stream gracefully.
-                yield b"data: [DONE]\n\n"
-            finally:
-                await self.router.release(decision)
+            return StreamingGatewayResponse(
+                stream=_stream_with_finalize(),
+                provider_instance_id=str(decision.candidate.instance_id),  # type: ignore[union-attr]
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                stats=stats,
+                trace_id=trace_context.trace_id if trace_context is not None else None,
+            )
+        except GatewayError as exc:
+            pre_stream_status_code = exc.status_code
+            pre_stream_error_code = exc.code
+            if trace_context is None:
+                trace_context = self.observability.start_request_trace(
+                    request_id=request_id,
+                    tenant_id=auth.tenant_id,
+                    user_id=auth.user_id,
+                    endpoint=endpoint,
+                    model_alias=model_alias,
+                    payload={"model": payload.get("model"), "_pii_mode": "pre_upstream_error"},
+                    privacy_mode=policy.privacy_mode if policy else None,
+                    stream=True,
+                    routing_metadata={"pii_fallback_outcome": fallback_outcome},
+                )
+            self.observability.record_failure(
+                trace_context,
+                status_code=exc.status_code,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                provider_instance_id=(
+                    str(decision.candidate.instance_id) if decision is not None else None
+                ),
+                error_code=exc.code,
+                error_message=exc.message,
+            )
+            raise
+        finally:
+            if not stream_started:
+                if decision is not None:
+                    await self.router.release(decision)
                 await self.audit.log(
                     request_id=request_id,
-                    trace_id=trace_context.trace_id,
+                    trace_id=trace_context.trace_id if trace_context is not None else None,
                     tenant_id=auth.tenant_id,
                     user_id=auth.user_id,
                     model_alias=model_alias,
-                    provider_instance_id=str(decision.candidate.instance_id),
+                    provider_instance_id=(
+                        str(decision.candidate.instance_id) if decision is not None else None
+                    ),
                     endpoint=endpoint,
-                    status_code=status_code,
+                    status_code=pre_stream_status_code,
                     latency_ms=int((time.perf_counter() - started) * 1000),
-                    ttft_ms=stats.ttft_ms,
-                    prompt_tokens=stats.usage.prompt_tokens,
-                    completion_tokens=stats.usage.completion_tokens,
-                    total_tokens=stats.usage.total_tokens,
-                    error_code=error_code,
+                    ttft_ms=None,
+                    prompt_tokens=None,
+                    completion_tokens=None,
+                    total_tokens=None,
+                    error_code=pre_stream_error_code or (
+                        "pii_fallback_to_local_succeeded"
+                        if fallback_outcome == "fallback_to_local_succeeded"
+                        else None
+                    ),
                 )
-                self.observability.finalize_stream(
-                    trace_context,
-                    status_code=status_code,
-                    latency_ms=int((time.perf_counter() - started) * 1000),
-                    ttft_ms=stats.ttft_ms,
-                    prompt_tokens=stats.usage.prompt_tokens,
-                    completion_tokens=stats.usage.completion_tokens,
-                    total_tokens=stats.usage.total_tokens,
-                    provider_instance_id=str(decision.candidate.instance_id),
-                    error_code=error_code,
-                )
-
-        return StreamingGatewayResponse(
-            stream=_stream_with_finalize(),
-            provider_instance_id=str(decision.candidate.instance_id),
-            latency_ms=int((time.perf_counter() - started) * 1000),
-            stats=stats,
-            trace_id=trace_context.trace_id,
-        )
 
     # ------------------------------------------------------------------
     # PII helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_cloud_provider(decision: RoutingDecision) -> bool:
+        """Return whether the routed provider is a cloud provider."""
+        return decision.candidate.provider_type == ProviderType.REMOTE_OPENAI
+
+    @staticmethod
+    def _is_local_candidate(decision: RoutingDecision) -> bool:
+        """Return whether the routed provider is local/on-prem."""
+        return not GatewayService._is_cloud_provider(decision)
+
+    async def _fallback_to_local_candidate(
+        self,
+        *,
+        current_decision: RoutingDecision,
+        candidates: list[Any],
+        request_id: str,
+    ) -> RoutingDecision:
+        """Release cloud lease and pick a local candidate for fallback."""
+        await self.router.release(current_decision)
+
+        local_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.provider_type != ProviderType.REMOTE_OPENAI
+        ]
+        if not local_candidates:
+            raise GatewayError(
+                status_code=503,
+                message="PII fallback requested but no local provider candidate is available.",
+                error_type="server_error",
+                code="pii_fallback_no_local_provider",
+            )
+        try:
+            return await self.router.pick_and_lease(
+                candidates=local_candidates,
+                request_id=request_id,
+            )
+        except GatewayError as exc:
+            if exc.code == "no_capacity":
+                raise GatewayError(
+                    status_code=503,
+                    message="PII fallback requested but no local provider has free capacity.",
+                    error_type="server_error",
+                    code="pii_fallback_no_local_capacity",
+                ) from exc
+            raise
 
     async def _apply_egress_pii(
         self,
@@ -406,6 +593,8 @@ class GatewayService:
                     error_type="server_error",
                     code="pii_service_unavailable",
                 )
+            if pii_policy.egress.fail_action == "fallback_to_local" and is_cloud:
+                raise _PIIFallbackToLocalRequested()
             logger.warning(
                 "PII egress scan failed for %s; fail_action=%s, allowing through",
                 request_id,

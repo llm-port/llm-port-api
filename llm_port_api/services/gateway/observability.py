@@ -70,6 +70,7 @@ class GatewayObservability:
         payload: dict[str, Any],
         privacy_mode: PrivacyMode | None,
         stream: bool,
+        routing_metadata: dict[str, Any] | None = None,
     ) -> GatewayTraceContext:
         """Create one gateway trace and root observation."""
         mode = privacy_mode or PrivacyMode.METADATA_ONLY
@@ -86,6 +87,8 @@ class GatewayObservability:
             "model_alias": model_alias,
             "stream": stream,
         }
+        if routing_metadata:
+            metadata.update(routing_metadata)
         sanitized_input = self._sanitize_input(
             endpoint=endpoint, payload=payload, mode=mode,
         )

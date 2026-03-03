@@ -20,7 +20,10 @@ from llm_port_api.db.models.gateway import (
     TenantLLMPolicy,
 )
 from llm_port_api.services.gateway.observability import GatewayTraceContext
+from llm_port_api.services.gateway.pii_client import PIIClient, SanitizeResult
 from llm_port_api.services.gateway.proxy import UpstreamProxy, UpstreamResult
+from llm_port_api.services.gateway.routing import RouterService
+from llm_port_api.services.registry import service_registry
 
 TEST_JWT_SECRET = "test-secret-32-bytes-minimum-value"
 
@@ -73,6 +76,95 @@ async def _seed_basic_graph(session: AsyncSession) -> uuid.UUID:
     session.add_all([alias, instance, membership, policy])
     await session.commit()
     return instance_id
+
+
+async def _seed_cloud_local_fallback_graph(
+    session: AsyncSession,
+    *,
+    with_local: bool,
+) -> tuple[uuid.UUID, uuid.UUID | None]:
+    alias = LLMModelAlias(
+        alias="qwen3-32b",
+        description="alias",
+        enabled=True,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+    remote_id = uuid.uuid4()
+    remote_instance = LLMProviderInstance(
+        id=remote_id,
+        type=ProviderType.REMOTE_OPENAI,
+        base_url="http://remote-upstream.local",
+        enabled=True,
+        weight=5.0,
+        max_concurrency=2,
+        capabilities=None,
+        health_status=ProviderHealthStatus.HEALTHY,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+    memberships = [
+        LLMPoolMembership(
+            model_alias="qwen3-32b",
+            provider_instance_id=remote_id,
+            enabled=True,
+        ),
+    ]
+    local_id: uuid.UUID | None = None
+    instances: list[LLMProviderInstance] = [remote_instance]
+    if with_local:
+        local_id = uuid.uuid4()
+        local_instance = LLMProviderInstance(
+            id=local_id,
+            type=ProviderType.VLLM,
+            base_url="http://local-upstream.local",
+            enabled=True,
+            weight=1.0,
+            max_concurrency=2,
+            capabilities=None,
+            health_status=ProviderHealthStatus.HEALTHY,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        instances.append(local_instance)
+        memberships.append(
+            LLMPoolMembership(
+                model_alias="qwen3-32b",
+                provider_instance_id=local_id,
+                enabled=True,
+            ),
+        )
+
+    policy = TenantLLMPolicy(
+        tenant_id="tenant-a",
+        privacy_mode=PrivacyMode.METADATA_ONLY,
+        allowed_model_aliases=["qwen3-32b"],
+        allowed_provider_types=["remote_openai", "vllm"] if with_local else ["remote_openai"],
+        rpm_limit=100,
+        tpm_limit=100000,
+        pii_config={
+            "telemetry": {"enabled": False},
+            "egress": {
+                "enabled_for_cloud": True,
+                "enabled_for_local": False,
+                "mode": "redact",
+                "fail_action": "fallback_to_local",
+            },
+            "presidio": {
+                "language": "en",
+                "threshold": 0.6,
+                "entities": ["EMAIL_ADDRESS", "PERSON"],
+            },
+        },
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+    session.add(alias)
+    session.add_all(instances)
+    session.add_all(memberships)
+    session.add(policy)
+    await session.commit()
+    return remote_id, local_id
 
 
 class _FakeObservability:
@@ -298,3 +390,197 @@ async def test_stream_mid_failure_returns_502_on_call(
     if response.status_code == 200:
         # Error can surface during stream consumption by client.
         assert "data:" in response.text
+
+
+@pytest.mark.anyio
+async def test_non_stream_fallback_to_local_on_pii_failure(
+    fastapi_app: FastAPI,
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _remote_id, local_id = await _seed_cloud_local_fallback_graph(db_session, with_local=True)
+    assert local_id is not None
+    fastapi_app.state.gateway_observability = _FakeObservability()
+    token = _token()
+    service_registry.configure("pii", enabled=True, url="http://pii.local")
+
+    async def fake_sanitize(self: PIIClient, **kwargs: object) -> SanitizeResult:  # noqa: ARG001
+        raise RuntimeError("pii service down")
+
+    async def fake_post_json(
+        self: UpstreamProxy, **kwargs: object,
+    ) -> UpstreamResult:
+        assert kwargs.get("base_url") == "http://local-upstream.local"
+        return UpstreamResult(
+            status_code=200,
+            payload={
+                "id": "chatcmpl_x",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "qwen3-32b",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "ok"},
+                    },
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 3,
+                    "total_tokens": 13,
+                },
+            },
+            headers={},
+        )
+
+    monkeypatch.setattr(PIIClient, "sanitize", fake_sanitize)
+    monkeypatch.setattr(UpstreamProxy, "post_json", fake_post_json)
+
+    try:
+        response = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "model": "qwen3-32b",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+    finally:
+        service_registry.configure("pii", enabled=False, url=None)
+
+    assert response.status_code == 200
+    assert response.headers["x-provider-instance-id"] == str(local_id)
+    rows = (await db_session.execute(select(LLMGatewayRequestLog))).scalars().all()
+    assert rows[-1].provider_instance_id == local_id
+    assert rows[-1].error_code == "pii_fallback_to_local_succeeded"
+
+
+@pytest.mark.anyio
+async def test_non_stream_fallback_to_local_no_local_candidate_returns_503(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _seed_cloud_local_fallback_graph(db_session, with_local=False)
+    token = _token()
+    service_registry.configure("pii", enabled=True, url="http://pii.local")
+
+    async def fake_sanitize(self: PIIClient, **kwargs: object) -> SanitizeResult:  # noqa: ARG001
+        raise RuntimeError("pii service down")
+
+    monkeypatch.setattr(PIIClient, "sanitize", fake_sanitize)
+
+    try:
+        response = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "model": "qwen3-32b",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+    finally:
+        service_registry.configure("pii", enabled=False, url=None)
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "pii_fallback_no_local_provider"
+
+
+@pytest.mark.anyio
+async def test_non_stream_fallback_to_local_no_local_capacity_returns_503(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _seed_cloud_local_fallback_graph(db_session, with_local=True)
+    token = _token()
+    service_registry.configure("pii", enabled=True, url="http://pii.local")
+
+    async def fake_sanitize(self: PIIClient, **kwargs: object) -> SanitizeResult:  # noqa: ARG001
+        raise RuntimeError("pii service down")
+
+    original_pick_and_lease = RouterService.pick_and_lease
+
+    async def fake_pick_and_lease(
+        self: RouterService,
+        *,
+        candidates: list[object],
+        request_id: str,
+    ):  # type: ignore[override]
+        candidate_types = [getattr(candidate, "provider_type", None) for candidate in candidates]
+        if candidate_types and all(candidate_type == ProviderType.VLLM for candidate_type in candidate_types):
+            raise GatewayError(
+                status_code=503,
+                message="No local capacity",
+                error_type="server_error",
+                code="no_capacity",
+            )
+        return await original_pick_and_lease(self, candidates=candidates, request_id=request_id)
+
+    monkeypatch.setattr(PIIClient, "sanitize", fake_sanitize)
+    monkeypatch.setattr(RouterService, "pick_and_lease", fake_pick_and_lease)
+
+    try:
+        response = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "model": "qwen3-32b",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+    finally:
+        service_registry.configure("pii", enabled=False, url=None)
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "pii_fallback_no_local_capacity"
+
+
+@pytest.mark.anyio
+async def test_stream_fallback_to_local_logs_final_provider(
+    fastapi_app: FastAPI,
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _remote_id, local_id = await _seed_cloud_local_fallback_graph(db_session, with_local=True)
+    assert local_id is not None
+    fastapi_app.state.gateway_observability = _FakeObservability()
+    token = _token()
+    service_registry.configure("pii", enabled=True, url="http://pii.local")
+
+    async def fake_sanitize(self: PIIClient, **kwargs: object) -> SanitizeResult:  # noqa: ARG001
+        raise RuntimeError("pii service down")
+
+    async def fake_stream_post(
+        self: UpstreamProxy, **kwargs: object,
+    ) -> AsyncIterator[bytes]:
+        assert kwargs.get("base_url") == "http://local-upstream.local"
+        yield b'data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"qwen3-32b","choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}]}\n\n'
+        yield b'data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"qwen3-32b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    monkeypatch.setattr(PIIClient, "sanitize", fake_sanitize)
+    monkeypatch.setattr(UpstreamProxy, "stream_post", fake_stream_post)
+
+    try:
+        response = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "model": "qwen3-32b",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+    finally:
+        service_registry.configure("pii", enabled=False, url=None)
+
+    assert response.status_code == 200
+    assert response.headers["x-provider-instance-id"] == str(local_id)
+    assert "data: [DONE]" in response.text
+    rows = (await db_session.execute(select(LLMGatewayRequestLog))).scalars().all()
+    assert rows[-1].provider_instance_id == local_id
+    assert rows[-1].error_code == "pii_fallback_to_local_succeeded"

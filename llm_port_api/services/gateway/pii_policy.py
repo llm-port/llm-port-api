@@ -72,6 +72,7 @@ def parse_pii_policy(raw: dict[str, Any] | None) -> PIIPolicy | None:
     if not raw:
         return None
 
+    default_entities = PIIPresidioConfig().entities
     tel_raw = raw.get("telemetry", {})
     egr_raw = raw.get("egress", {})
     pre_raw = raw.get("presidio", {})
@@ -90,7 +91,7 @@ def parse_pii_policy(raw: dict[str, Any] | None) -> PIIPolicy | None:
     presidio = PIIPresidioConfig(
         language=str(pre_raw.get("language", "en")),
         threshold=float(pre_raw.get("threshold", 0.6)),
-        entities=list(pre_raw.get("entities", PIIPresidioConfig.entities)),
+        entities=list(pre_raw.get("entities", default_entities)),
     )
 
     policy = PIIPolicy(telemetry=telemetry, egress=egress, presidio=presidio)
