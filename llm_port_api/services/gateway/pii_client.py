@@ -75,24 +75,6 @@ class PIIClient:
                 timeout=10.0,
                 headers={"x-pii-source": "gateway"},
             )
-
-            # Graceful mode downgrade: if the PII service returns 400
-            # for tokenize mode (Core-only deployment without PII Pro),
-            # automatically retry with mode=redact so the pipeline
-            # continues with best-effort protection.
-            if resp.status_code == 400 and effective_mode == "tokenize":
-                logger.warning(
-                    "PII service rejected tokenize mode (Core-only?); "
-                    "falling back to redact mode for request"
-                )
-                body["mode"] = "redact"
-                resp = await self._http.post(
-                    f"{self._base}/api/v1/pii/sanitize",
-                    json=body,
-                    timeout=10.0,
-                    headers={"x-pii-source": "gateway"},
-                )
-
             resp.raise_for_status()
             data = resp.json()
             return SanitizeResult(

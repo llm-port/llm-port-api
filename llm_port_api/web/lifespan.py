@@ -32,6 +32,13 @@ from llm_port_api.services.registry import service_registry
 from llm_port_api.settings import settings
 from llm_port_api.tkq import broker
 
+# ── Optional EE plugin ────────────────────────────────────────────
+try:
+    from llm_port_ee.plugins.gateway import gateway_plugin  # type: ignore[import-untyped]
+except ImportError:  # pragma: no cover
+    gateway_plugin = None
+# ──────────────────────────────────────────────────────────────────
+
 
 def setup_opentelemetry(app: FastAPI) -> None:  # pragma: no cover
     """
@@ -132,28 +139,18 @@ def _setup_db(app: FastAPI) -> None:  # pragma: no cover
     app.state.db_session_factory = session_factory
 
 
-async def _probe_observability_pro() -> bool:
-    """Check whether the Observability Pro sidecar is reachable.
+def _probe_observability_pro() -> bool:
+    """Check whether enterprise observability is available.
 
-    Same fallback pattern as ``PIIClient``: try reaching the sidecar
-    and degrade gracefully when it is absent.  If the sidecar is up,
-    its ``setup_ee()`` has already validated the EE license, so a
-    successful health check implies a valid enterprise deployment.
+    Returns ``True`` when the ``llm_port_ee`` gateway plugin is
+    installed, indicating enterprise observability features are
+    available in-process.
     """
-    url = settings.observability_pro_service_url
-    if not url:
-        return False
-    import httpx
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.get(f"{url.rstrip('/')}/api/health")
-            return resp.status_code == 200
-    except Exception:
-        return False
+    return gateway_plugin is not None and gateway_plugin.is_available()
 
 
-async def _setup_gateway_observability(app: FastAPI) -> None:
-    observability_pro_available = await _probe_observability_pro()
+def _setup_gateway_observability(app: FastAPI) -> None:
+    observability_pro_available = _probe_observability_pro()
 
     app.state.gateway_observability = GatewayObservability(
         enabled=settings.langfuse_enabled,
@@ -205,7 +202,7 @@ async def lifespan_setup(
     if not broker.is_worker_process:
         await broker.startup()
     _setup_db(app)
-    await _setup_gateway_observability(app)
+    _setup_gateway_observability(app)
     _setup_service_registry(app)
     app.state.http_client = create_shared_http_client(
         timeout_sec=settings.http_timeout_sec,

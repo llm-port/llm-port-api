@@ -120,9 +120,6 @@ class Settings(BaseSettings):
 
     langfuse_debug: bool = False
 
-    # Optional module: Observability Pro sidecar (health-checked at startup)
-    observability_pro_service_url: str | None = None
-
     @property
     def db_url(self) -> URL:
         """
