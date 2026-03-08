@@ -11,6 +11,7 @@ class ChatCompletionRequest(BaseModel):
     model: str = Field(min_length=1)
     messages: list[dict[str, Any]] = Field(min_length=1)
     stream: bool = False
+    session_id: str | None = None
 
     model_config = ConfigDict(extra="allow")
 

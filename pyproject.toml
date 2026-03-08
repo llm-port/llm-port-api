@@ -43,6 +43,7 @@ taskiq = "^0.11.10"
 taskiq-fastapi = "^0.3.3"
 taskiq-redis = "^1.0.2"
 taskiq-aio-pika = "^0.4.1"
+aiofiles = "^24.1.0"
 
 
 [tool.poetry.group.dev.dependencies]

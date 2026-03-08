@@ -90,6 +90,9 @@ class Settings(BaseSettings):
     backend_db_base: str = "llm_port_backend"
     settings_master_key: str = "dev-settings-master-key-change-me"
 
+    # Column-level encryption for chat data (empty = disabled / plaintext)
+    encryption_key: str = ""
+
     # Gateway behavior
     http_timeout_sec: float = 30.0
     lease_ttl_sec: int = 90
@@ -121,6 +124,27 @@ class Settings(BaseSettings):
     # Optional module: RAG Lite (embedded in backend — uses backend URL for search)
     rag_lite_enabled: bool = False
     rag_lite_backend_url: str = "http://127.0.0.1:8000"
+
+    # Optional module: Sessions & Memory
+    sessions_enabled: bool = True
+    session_max_recent_messages: int = 20
+    session_token_budget: int = 4096
+    session_summary_threshold: int = 10
+    session_summarizer_model: str | None = None
+    session_fact_extraction_enabled: bool = False
+    session_fact_extraction_model: str | None = None
+
+    # Chat file attachments
+    chat_file_store_root: str = "/data/llm-port/chat-files"
+    chat_upload_max_file_mb: int = 10
+    chat_upload_allowed_extensions: str = (
+        ".pdf,.docx,.pptx,.xlsx,.csv,.txt,.md,.html,.json,"
+        ".png,.jpg,.jpeg,.gif,.webp"
+    )
+    chat_docling_url: str | None = None
+    chat_max_attachments_per_session: int = 20
+    chat_max_total_attachment_mb: int = 50
+    chat_attachment_max_pages: int = 50
 
     langfuse_debug: bool = False
 

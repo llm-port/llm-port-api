@@ -8,6 +8,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -21,6 +22,7 @@ from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from llm_port_api.db.base import Base
+from llm_port_api.db.crypto import EncryptedJSON, EncryptedText
 
 
 class ProviderType(enum.StrEnum):
@@ -47,6 +49,30 @@ class PrivacyMode(enum.StrEnum):
     FULL = "full"
     REDACTED = "redacted"
     METADATA_ONLY = "metadata_only"
+
+
+class SessionStatus(enum.StrEnum):
+    """Chat session lifecycle status."""
+
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+    DELETED = "deleted"
+
+
+class MemoryFactScope(enum.StrEnum):
+    """Scope of a durable memory fact."""
+
+    SESSION = "session"
+    PROJECT = "project"
+    USER = "user"
+
+
+class MemoryFactStatus(enum.StrEnum):
+    """Lifecycle status of a memory fact."""
+
+    CANDIDATE = "candidate"
+    ACTIVE = "active"
+    EXPIRED = "expired"
 
 
 class LLMModelAlias(Base):
@@ -223,4 +249,296 @@ class LLMGatewayRequestLog(Base):
         nullable=False,
         server_default=func.now(),
         index=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chat: Projects, Sessions, Messages
+# ---------------------------------------------------------------------------
+
+
+class ChatProject(Base):
+    """A project groups related sessions and scopes memory."""
+
+    __tablename__ = "chat_project"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+    )
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    system_instructions: Mapped[str | None] = mapped_column(
+        EncryptedText("chat-content"), nullable=True,
+    )
+    model_alias: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    metadata_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        server_default=func.now(), onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_chat_project_tenant_user", "tenant_id", "user_id"),
+    )
+
+
+class ChatSession(Base):
+    """A single chat conversation thread."""
+
+    __tablename__ = "chat_session"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+    )
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("chat_project.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    title: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    status: Mapped[SessionStatus] = mapped_column(
+        SAEnum(
+            SessionStatus,
+            name="chat_session_status",
+            create_type=False,
+            values_callable=lambda e: [m.value for m in e],
+        ),
+        nullable=False,
+        default=SessionStatus.ACTIVE,
+    )
+    metadata_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        server_default=func.now(), onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_chat_session_tenant_user_status", "tenant_id", "user_id", "status"),
+    )
+
+
+class ChatMessage(Base):
+    """An individual message within a chat session."""
+
+    __tablename__ = "chat_message"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+    )
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("chat_session.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    content: Mapped[str] = mapped_column(EncryptedText("chat-content"), nullable=False)
+    content_parts_json: Mapped[list[Any] | None] = mapped_column(
+        EncryptedJSON("chat-content"), nullable=True,
+    )
+    tool_call_json: Mapped[dict[str, Any] | None] = mapped_column(
+        EncryptedJSON("chat-content"), nullable=True,
+    )
+    model_alias: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    provider_instance_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), nullable=True,
+    )
+    token_estimate: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        server_default=func.now(), index=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Summaries & Memory Facts
+# ---------------------------------------------------------------------------
+
+
+class SessionSummary(Base):
+    """Rolling summary of a session's conversation."""
+
+    __tablename__ = "session_summary"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+    )
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("chat_session.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    summary_text: Mapped[str] = mapped_column(
+        EncryptedText("chat-content"), nullable=False,
+    )
+    last_message_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), nullable=False,
+    )
+    token_estimate: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+
+class MemoryFact(Base):
+    """A durable memory fact extracted from or manually added to a session."""
+
+    __tablename__ = "memory_fact"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+    )
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    scope: Mapped[MemoryFactScope] = mapped_column(
+        SAEnum(
+            MemoryFactScope,
+            name="memory_fact_scope",
+            create_type=False,
+            values_callable=lambda e: [m.value for m in e],
+        ),
+        nullable=False,
+        default=MemoryFactScope.SESSION,
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("chat_session.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("chat_project.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    key: Mapped[str] = mapped_column(EncryptedText("chat-memory"), nullable=False)
+    value: Mapped[str] = mapped_column(EncryptedText("chat-memory"), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    source_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), nullable=True,
+    )
+    status: Mapped[MemoryFactStatus] = mapped_column(
+        SAEnum(
+            MemoryFactStatus,
+            name="memory_fact_status",
+            create_type=False,
+            values_callable=lambda e: [m.value for m in e],
+        ),
+        nullable=False,
+        default=MemoryFactStatus.CANDIDATE,
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        server_default=func.now(), onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_memory_fact_scope_lookup",
+            "tenant_id", "user_id", "scope", "status",
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chat Attachments
+# ---------------------------------------------------------------------------
+
+
+class AttachmentScope(enum.StrEnum):
+    """Scope of a chat attachment."""
+
+    SESSION = "session"
+    PROJECT = "project"
+
+
+class ExtractionStatus(enum.StrEnum):
+    """Text extraction status for an attachment."""
+
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class ChatAttachment(Base):
+    """A file attached to a chat session or project."""
+
+    __tablename__ = "chat_attachment"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+    )
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("chat_session.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("chat_project.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    message_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("chat_message.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    storage_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    extracted_text: Mapped[str | None] = mapped_column(
+        EncryptedText("chat-attachments"), nullable=True,
+    )
+    extraction_status: Mapped[ExtractionStatus] = mapped_column(
+        SAEnum(
+            ExtractionStatus,
+            name="chat_extraction_status",
+            create_type=False,
+            values_callable=lambda e: [m.value for m in e],
+        ),
+        nullable=False,
+        default=ExtractionStatus.PENDING,
+    )
+    scope: Mapped[AttachmentScope] = mapped_column(
+        SAEnum(
+            AttachmentScope,
+            name="chat_attachment_scope",
+            create_type=False,
+            values_callable=lambda e: [m.value for m in e],
+        ),
+        nullable=False,
+        default=AttachmentScope.SESSION,
+    )
+    page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    truncated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_chat_attachment_session", "session_id"),
+        Index("ix_chat_attachment_project", "project_id"),
+        Index("ix_chat_attachment_message", "message_id"),
+        Index("ix_chat_attachment_tenant_user", "tenant_id", "user_id"),
     )

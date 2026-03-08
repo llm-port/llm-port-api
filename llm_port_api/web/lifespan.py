@@ -22,6 +22,7 @@ from prometheus_fastapi_instrumentator.instrumentation import (
 )
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from llm_port_api.services.gateway.file_store import LocalFileStore
 from llm_port_api.services.gateway.observability import GatewayObservability
 from llm_port_api.services.gateway.proxy import create_shared_http_client
 from llm_port_api.services.gateway.jwt_secret import load_jwt_secret_from_backend_db
@@ -211,7 +212,10 @@ async def lifespan_setup(
     :return: function that actually performs actions.
     """
 
+    from llm_port_api.db.crypto import configure as configure_crypto
+
     app.middleware_stack = None
+    configure_crypto(settings.encryption_key)
     await _load_jwt_secret_from_backend_db()
     await load_system_settings_from_backend_db()
     if not broker.is_worker_process:
@@ -222,6 +226,15 @@ async def lifespan_setup(
     app.state.http_client = create_shared_http_client(
         timeout_sec=settings.http_timeout_sec,
     )
+    # Resource capacity limits (EE plugin overrides to None for unlimited)
+    app.state._resource_capacity = {"projects": 0x3}
+    if gateway_plugin is not None and hasattr(gateway_plugin, "override_resource_capacity"):
+        gateway_plugin.override_resource_capacity(app.state._resource_capacity)
+    # Chat file store
+    if settings.sessions_enabled:
+        app.state.chat_file_store = LocalFileStore(settings.chat_file_store_root)
+    else:
+        app.state.chat_file_store = None
     setup_opentelemetry(app)
     _init_cache(app)
     init_rabbit(app)

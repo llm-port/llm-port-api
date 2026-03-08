@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette import status
 
 from llm_port_api.db.dao.gateway_dao import GatewayDAO
+from llm_port_api.db.dao.session_dao import SessionDAO
 from llm_port_api.services.gateway.audit import AuditService
 from llm_port_api.services.gateway.auth import AuthContext, get_auth_context
 from llm_port_api.services.gateway.errors import GatewayError, error_response
@@ -50,6 +51,7 @@ async def list_services(request: Request) -> JSONResponse:
 def get_gateway_service(
     request: Request,
     dao: GatewayDAO = Depends(),
+    session_dao: SessionDAO = Depends(),
 ) -> GatewayService:
     """Build gateway service with request-scoped dependencies."""
     cache = request.app.state.cache_backend
@@ -92,6 +94,8 @@ def get_gateway_service(
         observability=observability,
         pii_client=pii_client,
         rag_lite_client=rag_lite_client,
+        session_dao=session_dao if settings.sessions_enabled else None,
+        file_store=getattr(request.app.state, "chat_file_store", None),
     )
 
 
@@ -159,11 +163,15 @@ async def create_chat_completions(
         parsed = ChatCompletionRequest.model_validate(payload)
         request_id = _request_id(request)
 
+        # Strip session_id from upstream payload but pass to service
+        session_id = payload.pop("session_id", None)
+
         if parsed.stream:
             streamed = await service.route_stream_chat(
                 auth=auth,
                 payload=payload,
                 request_id=request_id,
+                session_id=session_id,
             )
             stream_response = StreamingResponse(
                 streamed.stream,
@@ -183,6 +191,7 @@ async def create_chat_completions(
             endpoint="/v1/chat/completions",
             payload=payload,
             request_id=request_id,
+            session_id=session_id,
         )
         json_response = JSONResponse(
             status_code=non_stream.status_code,

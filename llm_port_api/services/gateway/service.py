@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from llm_port_api.db.dao.gateway_dao import GatewayDAO
+from llm_port_api.db.dao.session_dao import SessionDAO
 from llm_port_api.db.models.gateway import ProviderType
 from llm_port_api.services.gateway.audit import AuditService
 from llm_port_api.services.gateway.auth import AuthContext
@@ -25,6 +26,7 @@ from llm_port_api.services.gateway.usage import (
     estimate_input_tokens,
     usage_from_payload,
 )
+from llm_port_api.services.gateway.file_store import FileStore
 from llm_port_api.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -70,6 +72,8 @@ class GatewayService:
         observability: GatewayObservability,
         pii_client: PIIClient | None = None,
         rag_lite_client: RagLiteClient | None = None,
+        session_dao: SessionDAO | None = None,
+        file_store: FileStore | None = None,
     ) -> None:
         self.dao = dao
         self.router = router
@@ -79,6 +83,8 @@ class GatewayService:
         self.observability = observability
         self.pii_client = pii_client
         self.rag_lite_client = rag_lite_client
+        self.session_dao = session_dao
+        self._file_store = file_store
 
     async def list_models(self, auth: AuthContext) -> dict[str, Any]:
         aliases = await self.dao.list_enabled_aliases_for_tenant(auth.tenant_id)
@@ -102,6 +108,7 @@ class GatewayService:
         endpoint: str,
         payload: dict[str, Any],
         request_id: str,
+        session_id: str | None = None,
     ) -> GatewayResponse:
         started = time.perf_counter()
         model_alias = _require_model(payload)
@@ -133,6 +140,13 @@ class GatewayService:
         try:
             # RAG Lite context injection (before PII so context is scanned too)
             payload = await self._inject_rag_context(payload, auth)
+
+            # Session context injection (history + memory + summaries)
+            resolved_session_id: str | None = None
+            if endpoint == "/v1/chat/completions":
+                payload, resolved_session_id = await self._inject_session_context(
+                    payload, auth, session_id,
+                )
 
             pii_policy = _resolve_pii_policy(policy)
             egress_payload = payload
@@ -245,6 +259,17 @@ class GatewayService:
                     ),
                     output_payload=result.payload,
                 )
+            # Persist assistant response in session
+            await self._persist_assistant_response(
+                session_id_str=resolved_session_id,
+                response_payload=response_payload,
+                model_alias=model_alias,
+                provider_instance_id=(
+                    str(decision.candidate.instance_id) if decision is not None else None
+                ),
+                trace_id=trace_context.trace_id if trace_context is not None else None,
+            )
+
             return GatewayResponse(
                 status_code=result.status_code,
                 payload=response_payload,
@@ -310,6 +335,7 @@ class GatewayService:
         auth: AuthContext,
         payload: dict[str, Any],
         request_id: str,
+        session_id: str | None = None,
     ) -> StreamingGatewayResponse:
         started = time.perf_counter()
         endpoint = "/v1/chat/completions"
@@ -339,6 +365,12 @@ class GatewayService:
         try:
             # RAG Lite context injection (before PII so context is scanned too)
             payload = await self._inject_rag_context(payload, auth)
+
+            # Session context injection (history + memory + summaries)
+            resolved_stream_session_id: str | None = None
+            payload, resolved_stream_session_id = await self._inject_session_context(
+                payload, auth, session_id,
+            )
 
             pii_policy = _resolve_pii_policy(policy)
             egress_payload = payload
@@ -710,6 +742,141 @@ class GatewayService:
             *messages,
         ]
         return payload
+
+    async def _inject_session_context(
+        self,
+        payload: dict[str, Any],
+        auth: AuthContext,
+        session_id_str: str | None,
+    ) -> tuple[dict[str, Any], str | None]:
+        """Inject session history and memory into the payload.
+
+        Returns ``(updated_payload, resolved_session_id_hex)``
+        where the session id is ``None`` when sessions are disabled.
+        """
+        if not session_id_str or not self.session_dao:
+            return payload, None
+
+        import uuid as _uuid  # noqa: PLC0415
+
+        from llm_port_api.services.gateway.context_assembler import ContextAssembler  # noqa: PLC0415
+
+        try:
+            sid = _uuid.UUID(session_id_str)
+        except ValueError:
+            return payload, None
+
+        sess = await self.session_dao.get_session(
+            session_id=sid, tenant_id=auth.tenant_id, user_id=auth.user_id,
+        )
+        if not sess:
+            return payload, None
+
+        # Resolve project if the session belongs to one
+        project = None
+        if sess.project_id:
+            project = await self.session_dao.get_project(
+                project_id=sess.project_id,
+                tenant_id=auth.tenant_id,
+                user_id=auth.user_id,
+            )
+
+        # Resolve file store for attachment context injection
+        file_store = getattr(self, "_file_store", None)
+
+        assembler = ContextAssembler(
+            dao=self.session_dao,
+            max_recent_messages=settings.session_max_recent_messages,
+            token_budget=settings.session_token_budget,
+            file_store=file_store,
+        )
+
+        # Current request messages become the "tail" of the assembled context
+        current_messages = payload.get("messages", [])
+        assembled = await assembler.assemble(
+            session_id=sid,
+            tenant_id=auth.tenant_id,
+            user_id=auth.user_id,
+            current_messages=current_messages,
+            project=project,
+        )
+
+        payload["messages"] = assembled.messages
+
+        # Persist the user message(s)
+        for msg in current_messages:
+            if msg.get("role") in ("user", "system"):
+                content = msg.get("content", "")
+                # Handle multimodal content arrays
+                content_parts_json = None
+                if isinstance(content, list):
+                    content_parts_json = content
+                    content = " ".join(
+                        p.get("text", "") for p in content
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    ) or ""
+                await self.session_dao.append_message(
+                    session_id=sid,
+                    role=msg["role"],
+                    content=content,
+                    content_parts_json=content_parts_json,
+                )
+
+        return payload, str(sid)
+
+    async def _persist_assistant_response(
+        self,
+        *,
+        session_id_str: str | None,
+        response_payload: dict[str, Any],
+        model_alias: str | None = None,
+        provider_instance_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> None:
+        """Store the assistant's response message in the session."""
+        if not session_id_str or not self.session_dao:
+            return
+
+        import uuid as _uuid  # noqa: PLC0415
+
+        try:
+            sid = _uuid.UUID(session_id_str)
+        except ValueError:
+            return
+
+        choices = response_payload.get("choices", [])
+        if not choices:
+            return
+
+        msg_data = choices[0].get("message", {})
+        content = msg_data.get("content", "")
+        if not content:
+            return
+
+        # Handle multimodal assistant responses
+        content_parts_json = None
+        if isinstance(content, list):
+            content_parts_json = content
+            content = " ".join(
+                p.get("text", "") for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            ) or ""
+
+        usage = response_payload.get("usage", {})
+        tokens = usage.get("completion_tokens")
+
+        await self.session_dao.append_message(
+            session_id=sid,
+            role="assistant",
+            content=content,
+            content_parts_json=content_parts_json,
+            model_alias=model_alias,
+            provider_instance_id=(
+                _uuid.UUID(provider_instance_id) if provider_instance_id else None
+            ),
+            token_estimate=tokens,
+            trace_id=trace_id,
+        )
 
 
 def _resolve_pii_policy(
