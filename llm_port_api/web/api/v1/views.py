@@ -73,6 +73,16 @@ def get_gateway_service(
             http_client=request.app.state.http_client,
         )
 
+    # RAG Lite client (optional - when RAG Lite is enabled)
+    from llm_port_api.services.gateway.rag_lite_client import RagLiteClient  # noqa: PLC0415
+
+    rag_lite_client: RagLiteClient | None = None
+    if settings.rag_lite_enabled and not settings.rag_enabled:
+        rag_lite_client = RagLiteClient(
+            base_url=settings.rag_lite_backend_url,
+            http_client=request.app.state.http_client,
+        )
+
     return GatewayService(
         dao=dao,
         router=router_service,
@@ -81,6 +91,7 @@ def get_gateway_service(
         audit=audit,
         observability=observability,
         pii_client=pii_client,
+        rag_lite_client=rag_lite_client,
     )
 
 

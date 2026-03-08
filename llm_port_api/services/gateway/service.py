@@ -17,6 +17,7 @@ from llm_port_api.services.gateway.observability import (
 from llm_port_api.services.gateway.pii_client import PIIClient
 from llm_port_api.services.gateway.pii_policy import PIIPolicy, parse_pii_policy
 from llm_port_api.services.gateway.proxy import UpstreamProxy, UpstreamResult
+from llm_port_api.services.gateway.rag_lite_client import RagLiteClient
 from llm_port_api.services.gateway.ratelimit import RateLimiter
 from llm_port_api.services.gateway.routing import RouterService, RoutingDecision
 from llm_port_api.services.gateway.stream import StreamStats, wrap_sse_stream
@@ -68,6 +69,7 @@ class GatewayService:
         audit: AuditService,
         observability: GatewayObservability,
         pii_client: PIIClient | None = None,
+        rag_lite_client: RagLiteClient | None = None,
     ) -> None:
         self.dao = dao
         self.router = router
@@ -76,6 +78,7 @@ class GatewayService:
         self.audit = audit
         self.observability = observability
         self.pii_client = pii_client
+        self.rag_lite_client = rag_lite_client
 
     async def list_models(self, auth: AuthContext) -> dict[str, Any]:
         aliases = await self.dao.list_enabled_aliases_for_tenant(auth.tenant_id)
@@ -128,6 +131,9 @@ class GatewayService:
         usage_total = None
         trace_context = None
         try:
+            # RAG Lite context injection (before PII so context is scanned too)
+            payload = await self._inject_rag_context(payload, auth)
+
             pii_policy = _resolve_pii_policy(policy)
             egress_payload = payload
             token_mapping: dict[str, str] | None = None
@@ -331,6 +337,9 @@ class GatewayService:
         pre_stream_status_code = 500
         pre_stream_error_code: str | None = None
         try:
+            # RAG Lite context injection (before PII so context is scanned too)
+            payload = await self._inject_rag_context(payload, auth)
+
             pii_policy = _resolve_pii_policy(policy)
             egress_payload = payload
 
@@ -642,6 +651,65 @@ class GatewayService:
                 request_id,
             )
             return {"model": payload.get("model"), "_pii_mode": "fallback"}
+
+    async def _inject_rag_context(
+        self,
+        payload: dict[str, Any],
+        auth: AuthContext,
+    ) -> dict[str, Any]:
+        """Optionally inject RAG Lite context into the messages.
+
+        Looks for a ``rag`` dict in the payload (added by the frontend).
+        If present, queries the backend's RAG Lite search endpoint and
+        prepends a system message with the retrieved context.
+
+        The ``rag`` key is always stripped from the payload so the upstream
+        provider doesn't receive unknown fields.
+        """
+        rag_config = payload.pop("rag", None)
+        if not rag_config or not self.rag_lite_client:
+            return payload
+
+        # Extract search query from the last user message
+        messages = payload.get("messages", [])
+        user_query = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                user_query = content if isinstance(content, str) else str(content)
+                break
+
+        if not user_query:
+            return payload
+
+        results = await self.rag_lite_client.search(
+            query=user_query,
+            top_k=rag_config.get("top_k", 5),
+            collection_ids=rag_config.get("collection_ids"),
+        )
+
+        if not results:
+            return payload
+
+        # Build context block from search results
+        context_parts = []
+        for r in results:
+            src = r.get("filename", "unknown")
+            text = r.get("chunk_text", "")
+            context_parts.append(f"[Source: {src}]\n{text}")
+
+        context_block = (
+            "Use the following retrieved context to answer the user's question. "
+            "If the context is not relevant, ignore it.\n\n"
+            + "\n\n---\n\n".join(context_parts)
+        )
+
+        # Prepend as a system message
+        payload["messages"] = [
+            {"role": "system", "content": context_block},
+            *messages,
+        ]
+        return payload
 
 
 def _resolve_pii_policy(

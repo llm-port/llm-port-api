@@ -118,6 +118,10 @@ class Settings(BaseSettings):
     rag_service_url: str | None = None
     rag_enabled: bool = False
 
+    # Optional module: RAG Lite (embedded in backend — uses backend URL for search)
+    rag_lite_enabled: bool = False
+    rag_lite_backend_url: str = "http://127.0.0.1:8000"
+
     langfuse_debug: bool = False
 
     @property
