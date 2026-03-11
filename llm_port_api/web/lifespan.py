@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -39,6 +40,8 @@ try:
 except ImportError:  # pragma: no cover
     gateway_plugin = None
 # ──────────────────────────────────────────────────────────────────
+
+log = logging.getLogger(__name__)
 
 
 def setup_opentelemetry(app: FastAPI) -> None:  # pragma: no cover
@@ -223,8 +226,23 @@ async def lifespan_setup(
     configure_crypto(settings.encryption_key)
     await _load_jwt_secret_from_backend_db()
     await load_system_settings_from_backend_db()
+    # Connect to RabbitMQ with retries — RMQ may still be starting.
     if not broker.is_worker_process:
-        await broker.startup()
+        import asyncio
+
+        for attempt in range(1, 13):
+            try:
+                await broker.startup()
+                break
+            except Exception:
+                if attempt == 12:
+                    raise
+                log.warning(
+                    "RabbitMQ not ready (attempt %d/12). Retrying in 5 s\u2026",
+                    attempt,
+                )
+                await asyncio.sleep(5)
+
     _setup_db(app)
     _setup_gateway_observability(app)
     _setup_service_registry(app)
