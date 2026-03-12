@@ -14,6 +14,7 @@ from llm_port_api.services.gateway.audit import AuditService
 from llm_port_api.services.gateway.auth import AuthContext, get_auth_context
 from llm_port_api.services.gateway.errors import GatewayError, error_response
 from llm_port_api.services.gateway.lease import LeaseManager
+from llm_port_api.services.gateway.llm_adapter import LLMAdapter
 from llm_port_api.services.gateway.observability import GatewayObservability
 from llm_port_api.services.gateway.pii_client import PIIClient
 from llm_port_api.services.gateway.proxy import UpstreamProxy
@@ -89,6 +90,7 @@ def get_gateway_service(
         dao=dao,
         router=router_service,
         proxy=proxy,
+        adapter=LLMAdapter(),
         limiter=limiter,
         audit=audit,
         observability=observability,

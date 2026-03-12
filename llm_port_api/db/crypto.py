@@ -198,3 +198,17 @@ class EncryptedJSON(TypeDecorator):
                 logger.error("Failed to decrypt JSON column (purpose=%s)", self._purpose)
                 raise
         return json.loads(value)
+
+
+def decrypt_value(ciphertext: str, *, purpose: str = "default") -> str:
+    """Decrypt a standalone Fernet-encrypted string.
+
+    Used by the LLM adapter to decrypt API keys stored on
+    ``LLMProviderInstance.api_key_encrypted``.
+    """
+    f = _fernet_for(purpose)
+    if f is None:
+        return ciphertext  # encryption disabled — stored as plaintext
+    if not _is_ciphertext(ciphertext):
+        return ciphertext  # plaintext value
+    return f.decrypt(ciphertext.encode("ascii")).decode("utf-8")

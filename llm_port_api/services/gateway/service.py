@@ -12,6 +12,7 @@ from llm_port_api.db.models.gateway import ProviderType
 from llm_port_api.services.gateway.audit import AuditService
 from llm_port_api.services.gateway.auth import AuthContext
 from llm_port_api.services.gateway.errors import GatewayError
+from llm_port_api.services.gateway.llm_adapter import LLMAdapter
 from llm_port_api.services.gateway.observability import (
     GatewayObservability,
 )
@@ -34,6 +35,33 @@ logger = logging.getLogger(__name__)
 
 class _PIIFallbackToLocalRequested(Exception):
     """Signal that cloud egress should be rerouted to a local provider."""
+
+
+# ── PII context system prompts ───────────────────────────────────────────────
+_PII_REDACT_SYSTEM_PROMPT = (
+    "IMPORTANT — Privacy notice: The user's message has been processed by an "
+    "automated PII (Personally Identifiable Information) redaction system. "
+    "Certain sensitive values have been replaced with placeholders such as "
+    "[REDACTED_EMAIL_ADDRESS], [REDACTED_PHONE_NUMBER], [REDACTED_PERSON], "
+    "[REDACTED_CREDIT_CARD], etc. These placeholders indicate where real data "
+    "existed but was removed for privacy. "
+    "When responding, preserve these placeholders exactly as they appear — do "
+    "not attempt to guess the original values. If the user asks you to recall "
+    "or fill in a redacted value, politely explain that the information was "
+    "redacted for privacy."
+)
+
+_PII_TOKENIZE_SYSTEM_PROMPT = (
+    "IMPORTANT — Privacy notice: The user's message has been processed by an "
+    "automated PII (Personally Identifiable Information) tokenization system. "
+    "Certain sensitive values have been replaced with surrogate tokens in the "
+    "format [TOKEN_<hex>] (e.g. [TOKEN_a1b2c3]). Each token is a reversible "
+    "placeholder for a real value that will be restored after your response. "
+    "When responding, you MUST preserve these tokens exactly as they appear — "
+    "do not modify, decode, or remove them. Place them in the same logical "
+    "position in your answer so the de-tokenization step can restore the "
+    "original values correctly."
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -67,6 +95,7 @@ class GatewayService:
         dao: GatewayDAO,
         router: RouterService,
         proxy: UpstreamProxy,
+        adapter: LLMAdapter,
         limiter: RateLimiter,
         audit: AuditService,
         observability: GatewayObservability,
@@ -78,6 +107,7 @@ class GatewayService:
         self.dao = dao
         self.router = router
         self.proxy = proxy
+        self.adapter = adapter
         self.limiter = limiter
         self.audit = audit
         self.observability = observability
@@ -181,6 +211,12 @@ class GatewayService:
                         request_id=request_id,
                     )
 
+            # Inject PII context system prompt when egress was sanitized
+            if egress_payload is not payload and pii_policy:
+                egress_payload = self._inject_pii_system_prompt(
+                    egress_payload, pii_policy,
+                )
+
             obs_payload = egress_payload
             if pii_policy and self.pii_client and pii_policy.telemetry.enabled:
                 obs_payload = await self._apply_telemetry_pii(
@@ -203,10 +239,22 @@ class GatewayService:
 
             for attempt in range(settings.retry_pre_first_token + 1):
                 try:
-                    result = await self.proxy.post_json(
-                        base_url=decision.candidate.base_url,  # type: ignore[union-attr]
-                        path=endpoint,
+                    adapter_result = await self.adapter.completion(
+                        provider_type=decision.candidate.provider_type,
+                        base_url=decision.candidate.base_url,
+                        api_key_encrypted=decision.candidate.api_key_encrypted,
+                        litellm_provider=decision.candidate.litellm_provider,
+                        litellm_model=decision.candidate.litellm_model,
+                        extra_params=dict(decision.candidate.extra_params) if decision.candidate.extra_params else None,
                         payload=egress_payload,
+                        stream=False,
+                    )
+                    from llm_port_api.services.gateway.llm_adapter import CompletionResult  # noqa: PLC0415
+                    assert isinstance(adapter_result, CompletionResult)  # noqa: S101
+                    result = UpstreamResult(
+                        status_code=adapter_result.status_code,
+                        payload=adapter_result.payload,
+                        headers={},
                     )
                     status_code = result.status_code
                     break
@@ -405,6 +453,12 @@ class GatewayService:
                         request_id=request_id,
                     )
 
+            # Inject PII context system prompt when egress was sanitized
+            if egress_payload is not payload and pii_policy:
+                egress_payload = self._inject_pii_system_prompt(
+                    egress_payload, pii_policy,
+                )
+
             obs_payload = egress_payload
             if pii_policy and self.pii_client and pii_policy.telemetry.enabled:
                 obs_payload = await self._apply_telemetry_pii(
@@ -424,11 +478,18 @@ class GatewayService:
                 stream=True,
                 routing_metadata={"pii_fallback_outcome": fallback_outcome},
             )
-            raw_stream = self.proxy.stream_post(
-                base_url=decision.candidate.base_url,  # type: ignore[union-attr]
-                path=endpoint,
+            raw_stream = self.adapter.completion(
+                provider_type=decision.candidate.provider_type,
+                base_url=decision.candidate.base_url,
+                api_key_encrypted=decision.candidate.api_key_encrypted,
+                litellm_provider=decision.candidate.litellm_provider,
+                litellm_model=decision.candidate.litellm_model,
+                extra_params=dict(decision.candidate.extra_params) if decision.candidate.extra_params else None,
                 payload=egress_payload,
+                stream=True,
             )
+            # raw_stream is a coroutine returning AsyncIterator[bytes]
+            raw_stream = await raw_stream  # type: ignore[misc]
             wrapped_stream, stats = await wrap_sse_stream(raw_stream)
             stream_started = True
 
@@ -551,8 +612,8 @@ class GatewayService:
 
     @staticmethod
     def _is_cloud_provider(decision: RoutingDecision) -> bool:
-        """Return whether the routed provider is a cloud provider."""
-        return decision.candidate.provider_type == ProviderType.REMOTE_OPENAI
+        """Return whether the routed provider is a cloud/remote provider."""
+        return decision.candidate.provider_type.value.startswith("remote_")
 
     @staticmethod
     def _is_local_candidate(decision: RoutingDecision) -> bool:
@@ -572,7 +633,7 @@ class GatewayService:
         local_candidates = [
             candidate
             for candidate in candidates
-            if candidate.provider_type != ProviderType.REMOTE_OPENAI
+            if not candidate.provider_type.value.startswith("remote_")
         ]
         if not local_candidates:
             raise GatewayError(
@@ -595,6 +656,40 @@ class GatewayService:
                     code="pii_fallback_no_local_capacity",
                 ) from exc
             raise
+
+    @staticmethod
+    def _inject_pii_system_prompt(
+        egress_payload: dict[str, Any],
+        pii_policy: PIIPolicy,
+    ) -> dict[str, Any]:
+        """Prepend a system message explaining PII redaction/tokenization.
+
+        Only modifies ``messages``-based payloads (chat completions).
+        Returns a shallow-copied payload with the injected message.
+        """
+        messages = egress_payload.get("messages")
+        if not isinstance(messages, list):
+            return egress_payload
+
+        prompt = (
+            _PII_TOKENIZE_SYSTEM_PROMPT
+            if pii_policy.egress.mode == "tokenize_reversible"
+            else _PII_REDACT_SYSTEM_PROMPT
+        )
+
+        pii_system_msg: dict[str, str] = {"role": "system", "content": prompt}
+        # Insert after any existing leading system messages so we don't
+        # displace the user's own system prompt.
+        insert_idx = 0
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "system":
+                insert_idx = i + 1
+            else:
+                break
+
+        new_messages = list(messages)
+        new_messages.insert(insert_idx, pii_system_msg)
+        return {**egress_payload, "messages": new_messages}
 
     async def _apply_egress_pii(
         self,

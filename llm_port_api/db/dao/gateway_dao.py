@@ -27,6 +27,10 @@ class RoutedInstance:
     base_url: str
     weight: float
     max_concurrency: int
+    api_key_encrypted: str | None = None
+    litellm_provider: str | None = None
+    litellm_model: str | None = None
+    extra_params: dict | None = None
 
 
 class GatewayDAO:
@@ -110,6 +114,10 @@ class GatewayDAO:
                     base_url=instance.base_url.rstrip("/"),
                     weight=float(weight),
                     max_concurrency=max(instance.max_concurrency, 1),
+                    api_key_encrypted=instance.api_key_encrypted,
+                    litellm_provider=instance.litellm_provider,
+                    litellm_model=instance.litellm_model,
+                    extra_params=instance.extra_params,
                 ),
             )
         return candidates

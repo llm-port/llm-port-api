@@ -33,6 +33,15 @@ class ProviderType(enum.StrEnum):
     TGI = "tgi"
     OLLAMA = "ollama"
     REMOTE_OPENAI = "remote_openai"
+    REMOTE_ANTHROPIC = "remote_anthropic"
+    REMOTE_GOOGLE = "remote_google"
+    REMOTE_BEDROCK = "remote_bedrock"
+    REMOTE_AZURE = "remote_azure"
+    REMOTE_MISTRAL = "remote_mistral"
+    REMOTE_GROQ = "remote_groq"
+    REMOTE_DEEPSEEK = "remote_deepseek"
+    REMOTE_COHERE = "remote_cohere"
+    REMOTE_CUSTOM = "remote_custom"
 
 
 class ProviderHealthStatus(enum.StrEnum):
@@ -132,6 +141,22 @@ class LLMProviderInstance(Base):
         ),
         nullable=False,
         default=ProviderHealthStatus.UNKNOWN,
+    )
+    api_key_encrypted: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+        doc="Fernet-encrypted provider API key.",
+    )
+    litellm_provider: Mapped[str | None] = mapped_column(
+        String(64), nullable=True,
+        doc="LiteLLM provider prefix (e.g. 'anthropic', 'vertex_ai').",
+    )
+    litellm_model: Mapped[str | None] = mapped_column(
+        String(256), nullable=True,
+        doc="LiteLLM model identifier (e.g. 'claude-sonnet-4-20250514').",
+    )
+    extra_params: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON, nullable=True,
+        doc="Provider-specific params (region, project_id, api_version, custom headers).",
     )
     last_seen_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,

@@ -105,6 +105,11 @@ class Settings(BaseSettings):
     request_max_body_bytes: int = 2 * 1024 * 1024
     stream_idle_timeout_sec: float = 60.0
 
+    # LiteLLM settings
+    litellm_drop_params: bool = True
+    litellm_request_timeout: float = 60.0
+    litellm_verbose: bool = False
+
     # Langfuse observability
     langfuse_enabled: bool = False
     langfuse_host: str | None = None

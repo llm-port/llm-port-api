@@ -224,6 +224,15 @@ async def lifespan_setup(
 
     app.middleware_stack = None
     configure_crypto(settings.encryption_key)
+
+    # Configure LiteLLM module defaults
+    import litellm as _litellm  # noqa: PLC0415
+    _litellm.drop_params = settings.litellm_drop_params
+    _litellm.request_timeout = settings.litellm_request_timeout
+    if not settings.litellm_verbose:
+        _litellm.suppress_debug_info = True
+        logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+
     await _load_jwt_secret_from_backend_db()
     await load_system_settings_from_backend_db()
     # Connect to RabbitMQ with retries — RMQ may still be starting.
