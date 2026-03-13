@@ -150,6 +150,8 @@ class LLMAdapter:
             kwargs.update(extra_params)
 
         if stream:
+            # Request token usage in the final streaming chunk (OpenAI-compatible).
+            kwargs["stream_options"] = {"include_usage": True}
             return self._stream_completion(**kwargs)
 
         return await self._non_stream_completion(**kwargs)
@@ -187,12 +189,22 @@ class LLMAdapter:
         """Execute a streaming completion, yielding SSE-encoded bytes."""
         try:
             response = await litellm.acompletion(**kwargs)
+        except Exception as exc:
+            # Pre-stream failure — yield the error as an SSE event so the
+            # client receives a structured error instead of a broken stream.
+            logger.exception("LiteLLM streaming failed (pre-stream)")
+            error_data = _error_payload("server_error", str(exc))
+            yield f"data: {json.dumps(error_data)}\n\n".encode()
+            yield b"data: [DONE]\n\n"
+            return
+
+        try:
             async for chunk in response:  # type: ignore[union-attr]
                 data = chunk.model_dump()  # type: ignore[union-attr]
                 yield f"data: {json.dumps(data)}\n\n".encode()
             yield b"data: [DONE]\n\n"
         except Exception as exc:
-            logger.exception("LiteLLM streaming failed")
+            logger.exception("LiteLLM streaming failed (mid-stream)")
             error_data = _error_payload("server_error", str(exc))
             yield f"data: {json.dumps(error_data)}\n\n".encode()
             yield b"data: [DONE]\n\n"

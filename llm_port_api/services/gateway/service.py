@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -499,8 +500,11 @@ class GatewayService:
             async def _stream_with_finalize() -> AsyncIterator[bytes]:
                 stream_status_code = 200
                 stream_error_code: str | None = None
+                accumulated_content: list[str] = []
                 try:
                     async for chunk in wrapped_stream:
+                        # Collect assistant content for persistence
+                        _accumulate_stream_content(chunk, accumulated_content)
                         yield chunk
                 except Exception as exc:
                     stream_status_code = 502
@@ -509,6 +513,21 @@ class GatewayService:
                     # Response has already started; terminate stream gracefully.
                     yield b"data: [DONE]\n\n"
                 finally:
+                    # Persist the assistant response in the session
+                    if resolved_stream_session_id and accumulated_content:
+                        try:
+                            await self._persist_stream_assistant_response(
+                                session_id_str=resolved_stream_session_id,
+                                content="".join(accumulated_content),
+                                model_alias=model_alias,
+                                provider_instance_id=(
+                                    str(decision.candidate.instance_id) if decision is not None else None
+                                ),
+                                trace_id=trace_context.trace_id if trace_context is not None else None,
+                                token_estimate=stats.usage.completion_tokens if stats is not None else None,
+                            )
+                        except Exception:
+                            logger.warning("Failed to persist streamed assistant response", exc_info=True)
                     final_error_code = stream_error_code or (
                         "pii_fallback_to_local_succeeded"
                         if fallback_outcome == "fallback_to_local_succeeded"
@@ -975,6 +994,59 @@ class GatewayService:
             token_estimate=tokens,
             trace_id=trace_id,
         )
+
+    async def _persist_stream_assistant_response(
+        self,
+        *,
+        session_id_str: str,
+        content: str,
+        model_alias: str | None = None,
+        provider_instance_id: str | None = None,
+        trace_id: str | None = None,
+        token_estimate: int | None = None,
+    ) -> None:
+        """Store the accumulated streaming assistant response in the session."""
+        if not self.session_dao or not content:
+            return
+
+        import uuid as _uuid  # noqa: PLC0415
+
+        try:
+            sid = _uuid.UUID(session_id_str)
+        except ValueError:
+            return
+
+        await self.session_dao.append_message(
+            session_id=sid,
+            role="assistant",
+            content=content,
+            model_alias=model_alias,
+            provider_instance_id=(
+                _uuid.UUID(provider_instance_id) if provider_instance_id else None
+            ),
+            token_estimate=token_estimate,
+            trace_id=trace_id,
+        )
+
+
+def _accumulate_stream_content(chunk: bytes, acc: list[str]) -> None:
+    """Extract assistant content deltas from an SSE chunk and append to acc."""
+    text = chunk.decode("utf-8", errors="ignore")
+    for line in text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            parsed = json.loads(payload)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        choice = parsed.get("choices", [{}])[0] if parsed.get("choices") else None
+        if choice:
+            delta_content = choice.get("delta", {}).get("content")
+            if delta_content:
+                acc.append(delta_content)
 
 
 def _resolve_pii_policy(
