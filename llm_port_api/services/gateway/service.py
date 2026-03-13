@@ -123,9 +123,12 @@ class GatewayService:
             "data": [
                 {
                     "id": alias.alias,
+                    "alias": alias.alias,
                     "object": "model",
                     "created": int(alias.created_at.timestamp()),
                     "owned_by": "llm-port",
+                    "description": alias.description,
+                    "enabled": alias.enabled,
                 }
                 for alias in aliases
             ],

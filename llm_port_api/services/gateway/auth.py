@@ -66,6 +66,10 @@ def verify_token(token: str) -> dict[str, Any]:
         }
         if settings.jwt_audience:
             decode_opts["audience"] = settings.jwt_audience
+        else:
+            # When no audience is configured, skip audience verification so
+            # tokens with an "aud" claim (e.g. fastapi-users) are accepted.
+            decode_opts["options"] = {"verify_aud": False}
         if settings.jwt_issuer:
             decode_opts["issuer"] = settings.jwt_issuer
         claims = jwt.decode(
@@ -93,11 +97,9 @@ def get_auth_context_from_claims(claims: dict[str, Any]) -> AuthContext:
         )
     tenant_id = str(claims.get("tenant_id", "")).strip()
     if not tenant_id:
-        raise GatewayError(
-            status_code=403,
-            message="JWT token does not include tenant_id claim.",
-            code="missing_tenant_id",
-        )
+        # Default to "default" tenant for single-tenant deployments and
+        # fastapi-users tokens that don't carry a tenant_id claim.
+        tenant_id = "default"
     return AuthContext(user_id=user_id, tenant_id=tenant_id, raw_claims=claims)
 
 
