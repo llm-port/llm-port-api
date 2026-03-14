@@ -19,6 +19,7 @@ from llm_port_api.services.gateway.observability import GatewayObservability
 from llm_port_api.services.gateway.mcp_client import MCPClient
 from llm_port_api.services.gateway.mcp_tool_cache import MCPToolCache
 from llm_port_api.services.gateway.pii_client import PIIClient
+from llm_port_api.services.gateway.skills_client import SkillsClient
 from llm_port_api.services.gateway.proxy import UpstreamProxy
 from llm_port_api.services.gateway.ratelimit import RateLimiter
 from llm_port_api.services.gateway.routing import RouterService
@@ -90,6 +91,16 @@ def get_gateway_service(
         )
         mcp_tool_cache = MCPToolCache(mcp_client)
 
+    # Skills client (optional - when Skills module is enabled in registry)
+    skills_client: SkillsClient | None = None
+    skills_url = service_registry.get_url("skills")
+    if skills_url and settings.skills_service_token:
+        skills_client = SkillsClient(
+            base_url=skills_url,
+            http_client=request.app.state.http_client,
+            service_token=settings.skills_service_token,
+        )
+
     # RAG Lite client (optional - when RAG Lite is enabled)
     from llm_port_api.services.gateway.rag_lite_client import RagLiteClient  # noqa: PLC0415
 
@@ -114,6 +125,7 @@ def get_gateway_service(
         file_store=getattr(request.app.state, "chat_file_store", None),
         mcp_client=mcp_client,
         mcp_tool_cache=mcp_tool_cache,
+        skills_client=skills_client,
     )
 
 

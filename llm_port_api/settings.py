@@ -129,6 +129,11 @@ class Settings(BaseSettings):
     mcp_service_token: str = ""
     mcp_tool_loop_max_iterations: int = 5
 
+    # Optional module: Skills registry
+    skills_service_url: str | None = None
+    skills_enabled: bool = False
+    skills_service_token: str = ""
+
     # Optional module: External auth service
     auth_service_url: str | None = None
     auth_enabled: bool = False

@@ -206,6 +206,9 @@ def _setup_service_registry(app: FastAPI) -> None:
     service_registry.configure(
         "mcp", enabled=settings.mcp_enabled, url=settings.mcp_service_url,
     )
+    service_registry.configure(
+        "skills", enabled=settings.skills_enabled, url=settings.skills_service_url,
+    )
     app.state.service_registry = service_registry
 
 

@@ -25,6 +25,7 @@ from llm_port_api.services.gateway.proxy import UpstreamProxy, UpstreamResult
 from llm_port_api.services.gateway.rag_lite_client import RagLiteClient
 from llm_port_api.services.gateway.ratelimit import RateLimiter
 from llm_port_api.services.gateway.routing import RouterService, RoutingDecision
+from llm_port_api.services.gateway.skills_client import ResolvedSkill, SkillsClient
 from llm_port_api.services.gateway.stream import StreamStats, wrap_sse_stream
 from llm_port_api.services.gateway.usage import (
     estimate_input_tokens,
@@ -108,6 +109,7 @@ class GatewayService:
         file_store: FileStore | None = None,
         mcp_client: MCPClient | None = None,
         mcp_tool_cache: MCPToolCache | None = None,
+        skills_client: SkillsClient | None = None,
     ) -> None:
         self.dao = dao
         self.router = router
@@ -122,6 +124,7 @@ class GatewayService:
         self._file_store = file_store
         self.mcp_client = mcp_client
         self.mcp_tool_cache = mcp_tool_cache
+        self.skills_client = skills_client
 
     async def list_models(self, auth: AuthContext) -> dict[str, Any]:
         aliases = await self.dao.list_enabled_aliases_for_tenant(auth.tenant_id)
@@ -188,6 +191,13 @@ class GatewayService:
                     payload, auth, session_id,
                 )
 
+            # Skills injection (after session context, before PII)
+            resolved_skills: list[ResolvedSkill] = []
+            if endpoint == "/v1/chat/completions":
+                payload, resolved_skills = await self._inject_skills(
+                    payload, auth, session_id=resolved_session_id,
+                )
+
             pii_policy = _resolve_pii_policy(policy)
             egress_payload = payload
             token_mapping: dict[str, str] | None = None
@@ -251,6 +261,12 @@ class GatewayService:
             if endpoint == "/v1/chat/completions" and self.mcp_tool_cache:
                 egress_payload = await self._inject_mcp_tools(
                     egress_payload, auth.tenant_id,
+                )
+
+            # Apply skill-based tool constraints (after all tools are merged)
+            if resolved_skills:
+                egress_payload = self._apply_skill_tool_constraints(
+                    egress_payload, resolved_skills,
                 )
 
             for attempt in range(settings.retry_pre_first_token + 1):
@@ -341,6 +357,11 @@ class GatewayService:
                     str(decision.candidate.instance_id) if decision is not None else None
                 ),
                 trace_id=trace_context.trace_id if trace_context is not None else None,
+            )
+
+            # Record skills usage telemetry
+            await self._record_skills_usage(
+                resolved_skills, auth, session_id=resolved_session_id,
             )
 
             return GatewayResponse(
@@ -443,6 +464,12 @@ class GatewayService:
             resolved_stream_session_id: str | None = None
             payload, resolved_stream_session_id = await self._inject_session_context(
                 payload, auth, session_id,
+            )
+
+            # Skills injection (after session context, before PII)
+            resolved_stream_skills: list[ResolvedSkill] = []
+            payload, resolved_stream_skills = await self._inject_skills(
+                payload, auth, session_id=resolved_stream_session_id,
             )
 
             pii_policy = _resolve_pii_policy(policy)
@@ -549,6 +576,15 @@ class GatewayService:
                             )
                         except Exception:
                             logger.warning("Failed to persist streamed assistant response", exc_info=True)
+                    # Record skills usage telemetry
+                    if resolved_stream_skills:
+                        try:
+                            await self._record_skills_usage(
+                                resolved_stream_skills, auth,
+                                session_id=resolved_stream_session_id,
+                            )
+                        except Exception:
+                            logger.debug("Failed to record stream skills usage", exc_info=True)
                     final_error_code = stream_error_code or (
                         "pii_fallback_to_local_succeeded"
                         if fallback_outcome == "fallback_to_local_succeeded"
@@ -961,6 +997,130 @@ class GatewayService:
                 )
 
         return payload, str(sid)
+
+    # ── Skills helpers ───────────────────────────────────────────────────────
+
+    async def _inject_skills(
+        self,
+        payload: dict[str, Any],
+        auth: AuthContext,
+        session_id: str | None = None,
+    ) -> tuple[dict[str, Any], list[ResolvedSkill]]:
+        """Resolve active skills and inject their body as system messages.
+
+        Returns the (possibly modified) payload and the list of resolved
+        skills so callers can apply tool constraints and record usage later.
+        """
+        if not self.skills_client:
+            return payload, []
+
+        # Extract user query from last user message
+        user_query: str | None = None
+        for msg in reversed(payload.get("messages", [])):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    user_query = content
+                elif isinstance(content, list):
+                    user_query = " ".join(
+                        p.get("text", "") for p in content
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    )
+                break
+
+        result = await self.skills_client.resolve_skills(
+            tenant_id=auth.tenant_id,
+            user_id=auth.user_id,
+            session_id=session_id,
+            user_query=user_query,
+        )
+        if not result.skills:
+            return payload, []
+
+        # Inject each skill body as a system message after existing system messages
+        messages = list(payload.get("messages", []))
+        insert_idx = 0
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "system":
+                insert_idx = i + 1
+            else:
+                break
+
+        for skill in reversed(result.skills):
+            skill_msg = {
+                "role": "system",
+                "content": (
+                    f"=== ACTIVE SKILL: {skill.name} (v{skill.version}) ===\n"
+                    f"{skill.body_markdown}\n"
+                    f"=== END SKILL ==="
+                ),
+            }
+            messages.insert(insert_idx, skill_msg)
+
+        payload = {**payload, "messages": messages}
+        return payload, result.skills
+
+    def _apply_skill_tool_constraints(
+        self,
+        payload: dict[str, Any],
+        skills: list[ResolvedSkill],
+    ) -> dict[str, Any]:
+        """Filter the tools array based on skill constraints.
+
+        If any resolved skill specifies ``forbidden_tools``, those tools
+        are removed.  If any skill specifies ``allowed_tools``, only the
+        union of allowed tools across all skills is kept.
+        """
+        if not skills:
+            return payload
+
+        tools = payload.get("tools")
+        if not tools:
+            return payload
+
+        # Collect constraints across all resolved skills
+        all_allowed: set[str] | None = None
+        all_forbidden: set[str] = set()
+
+        for skill in skills:
+            if skill.forbidden_tools:
+                all_forbidden.update(skill.forbidden_tools)
+            if skill.allowed_tools:
+                if all_allowed is None:
+                    all_allowed = set()
+                all_allowed.update(skill.allowed_tools)
+
+        if all_allowed is None and not all_forbidden:
+            return payload
+
+        filtered: list[dict[str, Any]] = []
+        for tool in tools:
+            name = tool.get("function", {}).get("name", "")
+            if name in all_forbidden:
+                continue
+            if all_allowed is not None and name not in all_allowed:
+                continue
+            filtered.append(tool)
+
+        return {**payload, "tools": filtered}
+
+    async def _record_skills_usage(
+        self,
+        skills: list[ResolvedSkill],
+        auth: AuthContext,
+        session_id: str | None = None,
+    ) -> None:
+        """Fire-and-forget usage telemetry for resolved skills."""
+        if not self.skills_client or not skills:
+            return
+        for skill in skills:
+            await self.skills_client.record_usage(
+                tenant_id=auth.tenant_id,
+                skill_id=skill.skill_id,
+                version=skill.version,
+                session_id=session_id,
+                user_id=auth.user_id,
+            )
 
     # ── MCP tool helpers ─────────────────────────────────────────────────────
 
