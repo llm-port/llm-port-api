@@ -2,7 +2,7 @@ import uuid
 from dataclasses import dataclass
 
 from fastapi import Depends
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from llm_port_api.db.dependencies import get_db_session
@@ -43,9 +43,27 @@ class GatewayDAO:
         self,
         tenant_id: str,
     ) -> list[LLMModelAlias]:
-        """List aliases visible for tenant, applying tenant policy allowlist."""
+        """List aliases visible for tenant that have at least one healthy provider."""
         policy = await self.get_tenant_policy(tenant_id)
-        query = select(LLMModelAlias).where(LLMModelAlias.enabled.is_(True))
+
+        # Only return aliases backed by at least one healthy, enabled provider.
+        healthy_provider = (
+            exists()
+            .where(
+                LLMPoolMembership.model_alias == LLMModelAlias.alias,
+                LLMPoolMembership.enabled.is_(True),
+            )
+            .where(
+                LLMProviderInstance.id == LLMPoolMembership.provider_instance_id,
+                LLMProviderInstance.enabled.is_(True),
+                LLMProviderInstance.health_status == ProviderHealthStatus.HEALTHY,
+            )
+        )
+
+        query = select(LLMModelAlias).where(
+            LLMModelAlias.enabled.is_(True),
+            healthy_provider,
+        )
         if policy and policy.allowed_model_aliases:
             query = query.where(LLMModelAlias.alias.in_(policy.allowed_model_aliases))
         result = await self.session.execute(query.order_by(LLMModelAlias.alias.asc()))
