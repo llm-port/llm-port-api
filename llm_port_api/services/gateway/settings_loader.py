@@ -11,7 +11,11 @@ Keys loaded
 -----------
 - ``llm_port_api.pii_enabled`` → ``settings.pii_enabled``
 - ``llm_port_api.pii_service_url`` → ``settings.pii_service_url``
-- ``llm_port_api.pii_default_policy`` → ``settings.pii_default_policy``   (new attr)
+- ``llm_port_api.pii_default_policy`` → ``settings.pii_default_policy``
+- ``llm_port_api.mcp_enabled`` → ``settings.mcp_enabled``
+- ``llm_port_api.mcp_service_url`` → ``settings.mcp_service_url``
+- ``llm_port_api.skills_enabled`` → ``settings.skills_enabled``
+- ``llm_port_api.skills_service_url`` → ``settings.skills_service_url``
 """
 
 from __future__ import annotations
@@ -28,6 +32,10 @@ _VALUE_KEYS: dict[str, str] = {
     "llm_port_api.pii_enabled": "pii_enabled",
     "llm_port_api.pii_service_url": "pii_service_url",
     "llm_port_api.pii_default_policy": "pii_default_policy",
+    "llm_port_api.mcp_enabled": "mcp_enabled",
+    "llm_port_api.mcp_service_url": "mcp_service_url",
+    "llm_port_api.skills_enabled": "skills_enabled",
+    "llm_port_api.skills_service_url": "skills_service_url",
 }
 
 
