@@ -43,7 +43,7 @@ dependencies = [
   "taskiq-redis>=1.0.2",
   "taskiq-aio-pika>=0.4.1",
   "aiofiles>=24.1.0",
-  "litellm>=1.77,<2.0",
+  "litellm>=1.77,<1.82.7",  # upper-bound: 1.82.7 & 1.82.8 contained malware (supply-chain attack)
 ]
 
 [dependency-groups]
